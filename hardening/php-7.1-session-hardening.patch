@@ -1,0 +1,88 @@
+--- a/ext/session/php_session.h
++++ b/ext/session/php_session.h
+@@ -206,6 +206,8 @@
+ 	zend_bool lazy_write; /* omit session write when it is possible */
+ 	zend_bool in_save_handler; /* state that if session is in save handler or not */
+ 	zend_string *session_vars; /* serialized original session data */
++
++	zend_bool harden;          /* session.harden: deny object deserialization + sanitize upload_progress key */
+ } php_ps_globals;
+ 
+ typedef php_ps_globals zend_ps_globals;
+--- a/ext/session/session.c
++++ b/ext/session/session.c
+@@ -722,6 +722,7 @@
+ 	STD_PHP_INI_BOOLEAN("session.use_cookies",      "1",         PHP_INI_ALL, OnUpdateBool,   use_cookies,        php_ps_globals,    ps_globals)
+ 	STD_PHP_INI_BOOLEAN("session.use_only_cookies", "1",         PHP_INI_ALL, OnUpdateBool,   use_only_cookies,   php_ps_globals,    ps_globals)
+ 	STD_PHP_INI_BOOLEAN("session.use_strict_mode",  "0",         PHP_INI_ALL, OnUpdateBool,   use_strict_mode,    php_ps_globals,    ps_globals)
++	STD_PHP_INI_BOOLEAN("session.harden",           "0",         PHP_INI_SYSTEM, OnUpdateBool, harden,             php_ps_globals,    ps_globals)
+ 	STD_PHP_INI_ENTRY("session.referer_check",      "",          PHP_INI_ALL, OnUpdateString, extern_referer_chk, php_ps_globals,    ps_globals)
+ 	STD_PHP_INI_ENTRY("session.cache_limiter",      "nocache",   PHP_INI_ALL, OnUpdateString, cache_limiter,      php_ps_globals,    ps_globals)
+ 	STD_PHP_INI_ENTRY("session.cache_expire",       "180",       PHP_INI_ALL, OnUpdateLong,   cache_expire,       php_ps_globals,    ps_globals)
+@@ -764,6 +765,11 @@
+ 	return buf.s;
+ }
+ /* }}} */
++
++/* Shared empty allowed-classes set: makes session unserialize refuse every
++ * class (objects become __PHP_Incomplete_Class), neutralising serialize_handler
++ * mismatch object injection. Allocated once in MINIT. */
++static HashTable *php_session_no_classes = NULL;
+ 
+ PS_SERIALIZER_DECODE_FUNC(php_serialize) /* {{{ */
+ {
+@@ -775,6 +781,9 @@
+ 
+ 	ZVAL_NULL(&session_vars);
+ 	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	if (PS(harden) && php_session_no_classes) {
++		php_var_unserialize_set_allowed_classes(var_hash, php_session_no_classes);
++	}
+ 	result = php_var_unserialize(
+ 		&session_vars, (const unsigned char **)&val, (const unsigned char *)endptr, &var_hash);
+ 	PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+@@ -837,6 +846,9 @@
+ 	php_unserialize_data_t var_hash;
+ 
+ 	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	if (PS(harden) && php_session_no_classes) {
++		php_var_unserialize_set_allowed_classes(var_hash, php_session_no_classes);
++	}
+ 
+ 	for (p = val; p < endptr; ) {
+ 		namelen = ((unsigned char)(*p)) & (~PS_BIN_UNDEF);
+@@ -921,6 +933,9 @@
+ 	php_unserialize_data_t var_hash;
+ 
+ 	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	if (PS(harden) && php_session_no_classes) {
++		php_var_unserialize_set_allowed_classes(var_hash, php_session_no_classes);
++	}
+ 
+ 	p = val;
+ 
+@@ -2622,6 +2637,10 @@
+ {
+ 	zend_class_entry ce;
+ 
++	if (!php_session_no_classes) {
++		ALLOC_HASHTABLE(php_session_no_classes);
++		zend_hash_init(php_session_no_classes, 0, NULL, NULL, 1);
++	}
+ 	zend_register_auto_global(zend_string_init("_SESSION", sizeof("_SESSION") - 1, 1), 0, NULL);
+ 
+ 	my_module_number = module_number;
+@@ -2891,6 +2910,13 @@
+ 					smart_str_appends(&progress->key, PS(rfc1867_prefix));
+ 					smart_str_appendl(&progress->key, *data->value, value_len);
+ 					smart_str_0(&progress->key);
++					if (PS(harden) && progress->key.s) {
++						char *hk = ZSTR_VAL(progress->key.s);
++						size_t hl = ZSTR_LEN(progress->key.s), hi;
++						for (hi = 0; hi < hl; hi++) {
++							if (hk[hi] == '|' || hk[hi] == '!') hk[hi] = '_';
++						}
++					}
+ 
+ 					progress->apply_trans_sid = APPLY_TRANS_SID;
+ 					php_session_rfc1867_early_find_sid(progress);

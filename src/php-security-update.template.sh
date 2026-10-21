@@ -69,8 +69,15 @@ declare -A BACKPORT_COMMIT=(
 declare -A BACKPORT_SHA256
 __BACKPORT_SHA256_ASSIGN__
 
+# Opt-in session hardening patches (session.serialize_handler mismatch object
+# injection — a separate issue from the two CVEs; see hardening/ in the repo).
+readonly HARDEN_MARKER=".session-hardening"
+declare -A HARDEN_SHA256
+__HARDEN_SHA256_ASSIGN__
+
 CHECK_ONLY=0
 ASSUME_YES=0
+HARDEN=0
 ONLY_TAGS=""
 JOBS=""
 IS_TTY=0
@@ -95,7 +102,7 @@ CONF_ARGS=()
 BUILD_ENV=()
 MAKE_ARGS=()
 PLAN_TAGS=()
-declare -A PLAN_CUR PLAN_ACTION PLAN_TARGET PLAN_SHA PLAN_NOTE
+declare -A PLAN_CUR PLAN_ACTION PLAN_TARGET PLAN_SHA PLAN_NOTE PLAN_HARDEN
 declare -A RESULT_STATUS RESULT_AFTER RESULT_NOTE
 declare -A RELEASE_CACHE
 # Discovered PHP installs, keyed by a short id (tag). kind: baota|source|distro.
@@ -144,6 +151,10 @@ PHP 安全更新腳本 v${SCRIPT_VERSION}
   --check        只檢查並列出處理計畫，不做任何變更
   --only 74,82   只處理指定的 PHP 版本（以逗號分隔，可用版本號如 74 或安裝代號）
   --jobs N       編譯並行數（預設依 CPU 與記憶體自動決定）
+  --harden       額外套用 session 物件注入硬化（session.serialize_handler 混用，
+                 與本次 CVE 無關的另一個問題）：重編打上硬化補丁並開啟 session.harden，
+                 連已是最新版的 PHP 也會為此重編一次。會停用 session 物件反序列化，
+                 可能影響把物件存進 session 的應用，請先用 --check --harden 確認。
   -y, --yes      不倒數，立即開始
   -h, --help     顯示本說明
 
@@ -216,6 +227,7 @@ parse_args() {
 			--jobs) shift; JOBS=${1:-} ;;
 			--jobs=*) JOBS=${1#*=} ;;
 			-y|--yes) ASSUME_YES=1 ;;
+			--harden) HARDEN=1 ;;
 			-h|--help) usage; exit 0 ;;
 			*) usage; die "未知的參數：$1" ;;
 		esac
@@ -570,13 +582,45 @@ build_plan() {
 	done
 }
 
+# Second pass (only with --harden): schedule the session hardening patch for every
+# rebuildable install — including ones already on the latest fixed release.
+apply_harden_plan() {
+	local tag branch cur
+	for tag in "${PLAN_TAGS[@]}"; do
+		cur=${PLAN_CUR[$tag]}
+		[ "$cur" = 未知 ] && continue
+		branch=${cur%.*}
+		case "${INSTALL_KIND[$tag]}" in
+			distro)
+				# can't recompile; still offer the safe config subset + advice
+				[ "${PLAN_ACTION[$tag]}" = distro ] && PLAN_NOTE[$tag]="${PLAN_NOTE[$tag]}；硬化只套用設定" ;;
+			baota|source) ;;
+			*) continue ;;
+		esac
+		[ -n "${HARDEN_SHA256[$branch]:-}" ] || { PLAN_NOTE[$tag]="${PLAN_NOTE[$tag]}（PHP $branch 無硬化補丁）"; continue; }
+		case "${PLAN_ACTION[$tag]}" in
+			backport|upgrade)
+				PLAN_HARDEN[$tag]=1 PLAN_NOTE[$tag]="${PLAN_NOTE[$tag]} + session 硬化" ;;
+			ok)
+				if [ -f "${INSTALL_PREFIX[$tag]}/$HARDEN_MARKER" ]; then
+					PLAN_NOTE[$tag]="已修補且已硬化"
+				elif [ -n "${KNOWN_SHA256[$cur]:-}" ]; then
+					PLAN_ACTION[$tag]=harden PLAN_TARGET[$tag]=$cur PLAN_SHA[$tag]=${KNOWN_SHA256[$cur]} PLAN_HARDEN[$tag]=1
+					PLAN_NOTE[$tag]="重新編譯以套用 session 硬化"
+				else
+					PLAN_NOTE[$tag]="${PLAN_NOTE[$tag]}（版本 $cur 無法下載原始碼，硬化請手動處理）"
+				fi ;;
+		esac
+	done
+}
+
 print_plan() {
 	local tag color
 	title "已安裝的 PHP 版本"
 	for tag in "${PLAN_TAGS[@]}"; do
 		case "${PLAN_ACTION[$tag]}" in
 			ok) color=$C_GREEN ;;
-			upgrade|backport|mitigate|distro) color=$C_YELLOW ;;
+			upgrade|backport|mitigate|distro|harden) color=$C_YELLOW ;;
 			*) color=$C_RED ;;
 		esac
 		printf '  %-20s %-8s  %s%s%s\n' "${INSTALL_LABEL[$tag]}" "${PLAN_CUR[$tag]}" "$color" "${PLAN_NOTE[$tag]}" "$C_RESET"
@@ -899,6 +943,44 @@ apply_backport() {
 	fi
 }
 
+apply_hardening() {
+	local branch=$1 dir=$2 pf="$WORK_DIR/php-$1-hardening.patch"
+	harden_blob "$branch" | base64 -d | gzip -dc >"$pf" 2>>"$CUR_LOG"
+	if [ ! -s "$pf" ] || [ "$(sha256_of "$pf")" != "${HARDEN_SHA256[$branch]:-}" ]; then
+		err "內建 session 硬化補丁校驗失敗"
+		return 1
+	fi
+	if ! patch -p1 -d "$dir" --forward --batch <"$pf" >>"$CUR_LOG" 2>&1; then
+		err "session 硬化補丁套用失敗"
+		return 1
+	fi
+	ok "已套用 session 物件注入硬化補丁（PHP $branch）"
+}
+
+# Writes the opt-in session hardening + safe config into an install's php.ini.
+# want_flag=1 adds session.harden=1 (only for binaries built with the patch).
+apply_harden_config() {
+	local ini=$1 want_flag=$2
+	[ -f "$ini" ] || return 0
+	cp -p "$ini" "$BACKUP_DIR/$(basename "$ini").$RUN_ID.bak" 2>/dev/null
+	set_ini_value "$ini" session.upload_progress.enabled Off
+	set_ini_value "$ini" session.use_strict_mode 1
+	set_ini_value "$ini" session.use_only_cookies 1
+	[ "$want_flag" = 1 ] && set_ini_value "$ini" session.harden 1
+	return 0
+}
+
+# Idempotently sets "key = value" in a php.ini (updates existing, else appends).
+set_ini_value() {
+	local ini=$1 key=$2 val=$3 esc
+	esc=$(printf '%s' "$key" | sed 's/[.[\*^$]/\\&/g')
+	if grep -qE "^[[:space:]]*;?[[:space:]]*${esc}[[:space:]]*=" "$ini"; then
+		sed -i -E "s|^[[:space:]]*;?[[:space:]]*${esc}[[:space:]]*=.*$|${key} = ${val}|" "$ini"
+	else
+		printf '\n%s = %s\n' "$key" "$val" >>"$ini"
+	fi
+}
+
 read_configure_args() {
 	local prefix=$1 raw a found=0
 	CONF_ARGS=()
@@ -1085,8 +1167,12 @@ finalize_install() {
 	if [ "$mode" = backport ]; then
 		printf 'fixed=%s\nbase=%s\ncommit=%s\ndate=%s\n' "$CVE_LABEL" "$target" \
 			"${BACKPORT_COMMIT[${target%.*}]}" "$(date '+%F %T')" >"$prefix/$PATCH_MARKER"
-	else
+	elif [ "$mode" != harden ]; then
 		rm -f "$prefix/$PATCH_MARKER"
+	fi
+	if [ -n "${PLAN_HARDEN[$tag]:-}" ]; then
+		printf 'session_hardening=session.serialize_handler-mismatch\nbase=%s\ndate=%s\n' \
+			"$target" "$(date '+%F %T')" >"$prefix/$HARDEN_MARKER"
 	fi
 	[ -f "$prefix/src.tar.gz" ] && cp -f "$tarball" "$prefix/src.tar.gz"
 }
@@ -1097,7 +1183,9 @@ process_build() {
 	local build="$WORK_DIR/build-$tag" stage="$WORK_DIR/stage-$tag"
 	local tarball="$WORK_DIR/php-$target.tar.gz" label=$target staged built free
 	CUR_LOG="$LOG_DIR/php$tag-build-$RUN_ID.log"
-	[ "$mode" = backport ] && label="$target + 官方安全修補"
+	[ "$mode" = backport ] && label="$target + 安全修補"
+	[ "$mode" = harden ] && label="$target（重編以套用 session 硬化）"
+	[ -n "${PLAN_HARDEN[$tag]:-}" ] && [ "$mode" != harden ] && label="$label + session 硬化"
 	title "PHP $tag：$cur → $label"
 
 	free=$(free_mb "$SETUP_PATH")
@@ -1115,6 +1203,10 @@ process_build() {
 	fi
 	if [ "$mode" = backport ] && ! apply_backport "${target%.*}" "$build"; then
 		fail_version "$tag" "安全修補套用失敗"
+		return 1
+	fi
+	if [ -n "${PLAN_HARDEN[$tag]:-}" ] && ! apply_hardening "${target%.*}" "$build"; then
+		fail_version "$tag" "session 硬化補丁套用失敗"
 		return 1
 	fi
 	read_configure_args "$prefix" || { fail_version "$tag" "無法取得原本的編譯參數"; return 1; }
@@ -1146,6 +1238,9 @@ process_build() {
 	preflight_staged "$prefix" "$staged" || { fail_version "$tag" "新版本檢查未通過，已取消替換（線上版本沒有任何變動）"; return 1; }
 	backup_install "$tag" "$cur" || { fail_version "$tag" "備份失敗，已取消替換"; return 1; }
 
+	# Enable hardening in php.ini before the restart so reloaded workers pick it up
+	# (make install does not touch php.ini; the backup above covers rollback).
+	[ -n "${PLAN_HARDEN[$tag]:-}" ] && apply_harden_config "$(php_ini_path "$prefix")" 1
 	swap_install "$tag" "$prefix" "$staged" "$target"; local swap_rc=$?
 	if [ "$swap_rc" = 1 ]; then
 		fail_version "$tag" "新版本啟動驗證失敗，已自動還原為 $cur"
@@ -1153,19 +1248,23 @@ process_build() {
 	fi
 	finalize_install "$tag" "$prefix" "$target" "$mode" "$tarball"
 	rm -rf "$build" "$stage" "$tarball"
-	local manual=""
+	local manual="" hsfx=""
 	[ "$swap_rc" = 3 ] && manual="（請手動重啟 PHP-FPM 讓修補生效）"
-	if [ "$mode" = backport ]; then
+	[ -n "${PLAN_HARDEN[$tag]:-}" ] && hsfx="＋session 硬化"
+	if [ "$mode" = harden ]; then
+		ok "PHP $tag 已重新編譯並套用 session 硬化$manual"
+		set_result "$tag" patched "$target" "已套用 session 硬化$manual"
+	elif [ "$mode" = backport ]; then
 		if [ -n "${BACKPORT_OFFICIAL[${target%.*}]:-}" ]; then
-			ok "PHP $tag 已更新為 $target 並套用官方安全修補$manual"
-			set_result "$tag" patched "$target" "已套用官方安全修補$manual"
+			ok "PHP $tag 已更新為 $target 並套用官方安全修補$hsfx$manual"
+			set_result "$tag" patched "$target" "已套用官方安全修補$hsfx$manual"
 		else
-			ok "PHP $tag 已重新編譯並套用安全修補（本專案移植，非官方）$manual"
-			set_result "$tag" patched "$target" "已套用安全修補（本專案移植）$manual"
+			ok "PHP $tag 已重新編譯並套用安全修補（本專案移植，非官方）$hsfx$manual"
+			set_result "$tag" patched "$target" "已套用安全修補（本專案移植）$hsfx$manual"
 		fi
 	else
-		ok "PHP $tag 已升級為 $target$manual"
-		set_result "$tag" upgraded "$target" "已升級$manual"
+		ok "PHP $tag 已升級為 $target$hsfx$manual"
+		set_result "$tag" upgraded "$target" "已升級$hsfx$manual"
 	fi
 }
 
@@ -1263,6 +1362,13 @@ print_summary() {
 		printf '  %-20s%s\n' "${INSTALL_LABEL[$tag]}" "${sites:+  使用中的網站：$sites}"
 	done
 
+	if [ "$HARDEN" = 1 ]; then
+		printf '\n%sSession 硬化提醒：%s\n' "$C_YELLOW" "$C_RESET"
+		printf '  • 已開啟 session.harden（停用 session 物件反序列化）。若有應用把物件存進 session 會受影響，請測試。\n'
+		printf '  • 請一併移除各網站 .user.ini / .htaccess / FPM pool 中對 session.serialize_handler 的覆寫，全站統一為 php_serialize。\n'
+		printf '  • 登入後呼叫 session_regenerate_id(true) 屬應用層，請自行在程式碼落實。\n'
+	fi
+
 	if [ "$MAIN_LOG" != /dev/null ]; then
 		printf '\n'
 		info "備份目錄：$BACKUP_DIR"
@@ -1318,6 +1424,7 @@ main() {
 		warn "沒有符合 --only 條件的 PHP"
 		finish 0
 	fi
+	[ "$HARDEN" = 1 ] && apply_harden_plan
 	print_plan
 
 	local advise=0
@@ -1325,9 +1432,11 @@ main() {
 		case "${PLAN_ACTION[$tag]}" in
 			upgrade) builds=$((builds + 1)) pending=1 ;;
 			backport) builds=$((builds + 1)) pending=1 need_patch=1 ;;
+			harden) builds=$((builds + 1)) pending=1 need_patch=1 ;;
 			mitigate) pending=1 ;;
 			distro|warn) advise=1 ;;
 		esac
+		[ -n "${PLAN_HARDEN[$tag]:-}" ] && need_patch=1
 	done
 
 	if [ "$CHECK_ONLY" = 1 ]; then
@@ -1370,11 +1479,13 @@ main() {
 	for tag in "${PLAN_TAGS[@]}"; do
 		action=${PLAN_ACTION[$tag]}
 		case "$action" in
-			upgrade|backport) process_build "$tag" "$action" ;;
+			upgrade|backport|harden) process_build "$tag" "$action" ;;
 			mitigate) process_mitigation "$tag" ;;
 			ok) set_result "$tag" ok "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			mitigated) set_result "$tag" mitigated "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
-			distro) set_result "$tag" distro "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
+			distro)
+				[ "$HARDEN" = 1 ] && apply_harden_config "$(php_ini_path "${INSTALL_PREFIX[$tag]}")" 0
+				set_result "$tag" distro "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			warn) set_result "$tag" warn "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			*) set_result "$tag" skip "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 		esac
@@ -1388,5 +1499,8 @@ main() {
 # Each patch (patches/php-<branch>.patch) is gzip+base64-embedded below at build time.
 # backport_blob <branch> writes the encoded blob to stdout.
 __BACKPORT_BLOBS__
+
+# Opt-in session hardening patches (hardening/php-<branch>-session-hardening.patch).
+__HARDEN_BLOBS__
 
 main "$@"

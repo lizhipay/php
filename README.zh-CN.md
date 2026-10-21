@@ -53,6 +53,25 @@ bash php-security-update.sh --only 74,82 # 只处理指定版本（版本号或�
 bash php-security-update.sh -y           # 不倒计时，直接开始
 ```
 
+### 可选：session 对象注入硬化（`--harden`）
+
+这是跟两个 CVE **无关的另一个**问题（官方这次的补丁不修它）：经典的
+`session.serialize_handler` 混用对象注入——攻击者拿到对受控对象的 `unserialize()`
+（常经由 `session.upload_progress`），再靠 POP chain 的 `__wakeup`/`__destruct` 执行代码。
+
+```bash
+bash php-security-update.sh --check --harden   # 预览
+bash php-security-update.sh --harden -y        # 套用
+```
+
+`--harden` 会为每个 PHP 重编并打上一个 opt-in 源代码补丁：新增 `session.harden` ini
+（默认关），开启它，并设定安全的 session 配置（`upload_progress.enabled=0`、
+`use_strict_mode=1`、`use_only_cookies=1`）。开启后 session 解码拒绝实例化对象（一律变
+`__PHP_Incomplete_Class`），并净化 upload_progress key。**即使某个 PHP 已是最新版，也会为
+它重编一次**以打上补丁。注意：它会停用 session 的对象反序列化，把对象存进 session 的应用会
+受影响，请先用 `--check` 预览。PHP 5.4–5.6 只能封住 upload_progress 向量（7.0 以前无法做
+对象拒绝），详见 [hardening/](hardening/)。
+
 ### 安全设计
 
 - 每个版本编译并通过检查后**才替换**；替换前**完整备份**，启动验证失败会**自动还原**——网站只在 FPM 重启时中断约 1~2 秒。

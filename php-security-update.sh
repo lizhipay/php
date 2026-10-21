@@ -78,8 +78,28 @@ BACKPORT_SHA256[7.4]=5fe57ca6ee96d59b36c6e0ca842843c50884f177bef1e85234cf669b577
 BACKPORT_SHA256[8.0]=534478c973cef6f493605b7af907f639a364912ee92c24598ddae44c3bc72d1c
 BACKPORT_SHA256[8.1]=c85ad0fddcbff7f2318617eeaa54d271135463b5bf70a01228447e3ed78de96e
 
+# Opt-in session hardening patches (session.serialize_handler mismatch object
+# injection — a separate issue from the two CVEs; see hardening/ in the repo).
+readonly HARDEN_MARKER=".session-hardening"
+declare -A HARDEN_SHA256
+HARDEN_SHA256[5.4]=27935227e7f8d2b9285af3ee52da95ab0fc545b265848eb28fddb8d975a7fe5a
+HARDEN_SHA256[5.5]=5bd602e07d2039be4c44327e1d3cadc3c56815cbaf5c8574987a9c37f401e545
+HARDEN_SHA256[5.6]=4ae45968b7eb9cbfaf7ad6ef65beca21ec875643a2dee138d1d6a0d77c4de14a
+HARDEN_SHA256[7.0]=4982b73129f0adfec9b870163fbcc2387b2c8591b4a32a63940fb4bb132f84f6
+HARDEN_SHA256[7.1]=a4ca2a1b62e620dac176de30ff1166d16988c079a9b94a69dad1d0a2ef48071d
+HARDEN_SHA256[7.2]=9314da4bd40a6e39941cd8e07c694d4b8c75c5cbda46c4250726f5e048a36980
+HARDEN_SHA256[7.3]=55c7ed7ad3c78aae35d91a2cb5c0ac5b963e1b98441da3d10a9dc23bf7c50b0a
+HARDEN_SHA256[7.4]=8104cd34f15b93fbd4de2826481e8c258bab45e7d18bcf676724cea753e587fb
+HARDEN_SHA256[8.0]=db7b9d833456a69b12f195f64275b26276badb3aeebe2c9ee477a691099ed385
+HARDEN_SHA256[8.1]=dd983f9a4d36918a9ca29d4a4feaba8e201e241f13ec28102fbb0002a02eb36d
+HARDEN_SHA256[8.2]=a9c0e99265371e5d6a607430d2dabd46b5855682f8c74c81fe7a5f7d3c62c625
+HARDEN_SHA256[8.3]=09d82f898843f4d4a4b4439d758bbcb25b51958f2f7a240eef800653c4ed6195
+HARDEN_SHA256[8.4]=d6a9b14c74542532ac0babfd17a7581171b7f0fd7299df0b8d5d2a9dcdda9b0e
+HARDEN_SHA256[8.5]=1612af9dc3159af0da05f41974bfd904aa007feb134b29a7d7d67dc218a4c802
+
 CHECK_ONLY=0
 ASSUME_YES=0
+HARDEN=0
 ONLY_TAGS=""
 JOBS=""
 IS_TTY=0
@@ -104,7 +124,7 @@ CONF_ARGS=()
 BUILD_ENV=()
 MAKE_ARGS=()
 PLAN_TAGS=()
-declare -A PLAN_CUR PLAN_ACTION PLAN_TARGET PLAN_SHA PLAN_NOTE
+declare -A PLAN_CUR PLAN_ACTION PLAN_TARGET PLAN_SHA PLAN_NOTE PLAN_HARDEN
 declare -A RESULT_STATUS RESULT_AFTER RESULT_NOTE
 declare -A RELEASE_CACHE
 # Discovered PHP installs, keyed by a short id (tag). kind: baota|source|distro.
@@ -153,6 +173,10 @@ PHP 安全更新腳本 v${SCRIPT_VERSION}
   --check        只檢查並列出處理計畫，不做任何變更
   --only 74,82   只處理指定的 PHP 版本（以逗號分隔，可用版本號如 74 或安裝代號）
   --jobs N       編譯並行數（預設依 CPU 與記憶體自動決定）
+  --harden       額外套用 session 物件注入硬化（session.serialize_handler 混用，
+                 與本次 CVE 無關的另一個問題）：重編打上硬化補丁並開啟 session.harden，
+                 連已是最新版的 PHP 也會為此重編一次。會停用 session 物件反序列化，
+                 可能影響把物件存進 session 的應用，請先用 --check --harden 確認。
   -y, --yes      不倒數，立即開始
   -h, --help     顯示本說明
 
@@ -225,6 +249,7 @@ parse_args() {
 			--jobs) shift; JOBS=${1:-} ;;
 			--jobs=*) JOBS=${1#*=} ;;
 			-y|--yes) ASSUME_YES=1 ;;
+			--harden) HARDEN=1 ;;
 			-h|--help) usage; exit 0 ;;
 			*) usage; die "未知的參數：$1" ;;
 		esac
@@ -579,13 +604,45 @@ build_plan() {
 	done
 }
 
+# Second pass (only with --harden): schedule the session hardening patch for every
+# rebuildable install — including ones already on the latest fixed release.
+apply_harden_plan() {
+	local tag branch cur
+	for tag in "${PLAN_TAGS[@]}"; do
+		cur=${PLAN_CUR[$tag]}
+		[ "$cur" = 未知 ] && continue
+		branch=${cur%.*}
+		case "${INSTALL_KIND[$tag]}" in
+			distro)
+				# can't recompile; still offer the safe config subset + advice
+				[ "${PLAN_ACTION[$tag]}" = distro ] && PLAN_NOTE[$tag]="${PLAN_NOTE[$tag]}；硬化只套用設定" ;;
+			baota|source) ;;
+			*) continue ;;
+		esac
+		[ -n "${HARDEN_SHA256[$branch]:-}" ] || { PLAN_NOTE[$tag]="${PLAN_NOTE[$tag]}（PHP $branch 無硬化補丁）"; continue; }
+		case "${PLAN_ACTION[$tag]}" in
+			backport|upgrade)
+				PLAN_HARDEN[$tag]=1 PLAN_NOTE[$tag]="${PLAN_NOTE[$tag]} + session 硬化" ;;
+			ok)
+				if [ -f "${INSTALL_PREFIX[$tag]}/$HARDEN_MARKER" ]; then
+					PLAN_NOTE[$tag]="已修補且已硬化"
+				elif [ -n "${KNOWN_SHA256[$cur]:-}" ]; then
+					PLAN_ACTION[$tag]=harden PLAN_TARGET[$tag]=$cur PLAN_SHA[$tag]=${KNOWN_SHA256[$cur]} PLAN_HARDEN[$tag]=1
+					PLAN_NOTE[$tag]="重新編譯以套用 session 硬化"
+				else
+					PLAN_NOTE[$tag]="${PLAN_NOTE[$tag]}（版本 $cur 無法下載原始碼，硬化請手動處理）"
+				fi ;;
+		esac
+	done
+}
+
 print_plan() {
 	local tag color
 	title "已安裝的 PHP 版本"
 	for tag in "${PLAN_TAGS[@]}"; do
 		case "${PLAN_ACTION[$tag]}" in
 			ok) color=$C_GREEN ;;
-			upgrade|backport|mitigate|distro) color=$C_YELLOW ;;
+			upgrade|backport|mitigate|distro|harden) color=$C_YELLOW ;;
 			*) color=$C_RED ;;
 		esac
 		printf '  %-20s %-8s  %s%s%s\n' "${INSTALL_LABEL[$tag]}" "${PLAN_CUR[$tag]}" "$color" "${PLAN_NOTE[$tag]}" "$C_RESET"
@@ -908,6 +965,44 @@ apply_backport() {
 	fi
 }
 
+apply_hardening() {
+	local branch=$1 dir=$2 pf="$WORK_DIR/php-$1-hardening.patch"
+	harden_blob "$branch" | base64 -d | gzip -dc >"$pf" 2>>"$CUR_LOG"
+	if [ ! -s "$pf" ] || [ "$(sha256_of "$pf")" != "${HARDEN_SHA256[$branch]:-}" ]; then
+		err "內建 session 硬化補丁校驗失敗"
+		return 1
+	fi
+	if ! patch -p1 -d "$dir" --forward --batch <"$pf" >>"$CUR_LOG" 2>&1; then
+		err "session 硬化補丁套用失敗"
+		return 1
+	fi
+	ok "已套用 session 物件注入硬化補丁（PHP $branch）"
+}
+
+# Writes the opt-in session hardening + safe config into an install's php.ini.
+# want_flag=1 adds session.harden=1 (only for binaries built with the patch).
+apply_harden_config() {
+	local ini=$1 want_flag=$2
+	[ -f "$ini" ] || return 0
+	cp -p "$ini" "$BACKUP_DIR/$(basename "$ini").$RUN_ID.bak" 2>/dev/null
+	set_ini_value "$ini" session.upload_progress.enabled Off
+	set_ini_value "$ini" session.use_strict_mode 1
+	set_ini_value "$ini" session.use_only_cookies 1
+	[ "$want_flag" = 1 ] && set_ini_value "$ini" session.harden 1
+	return 0
+}
+
+# Idempotently sets "key = value" in a php.ini (updates existing, else appends).
+set_ini_value() {
+	local ini=$1 key=$2 val=$3 esc
+	esc=$(printf '%s' "$key" | sed 's/[.[\*^$]/\\&/g')
+	if grep -qE "^[[:space:]]*;?[[:space:]]*${esc}[[:space:]]*=" "$ini"; then
+		sed -i -E "s|^[[:space:]]*;?[[:space:]]*${esc}[[:space:]]*=.*$|${key} = ${val}|" "$ini"
+	else
+		printf '\n%s = %s\n' "$key" "$val" >>"$ini"
+	fi
+}
+
 read_configure_args() {
 	local prefix=$1 raw a found=0
 	CONF_ARGS=()
@@ -1094,8 +1189,12 @@ finalize_install() {
 	if [ "$mode" = backport ]; then
 		printf 'fixed=%s\nbase=%s\ncommit=%s\ndate=%s\n' "$CVE_LABEL" "$target" \
 			"${BACKPORT_COMMIT[${target%.*}]}" "$(date '+%F %T')" >"$prefix/$PATCH_MARKER"
-	else
+	elif [ "$mode" != harden ]; then
 		rm -f "$prefix/$PATCH_MARKER"
+	fi
+	if [ -n "${PLAN_HARDEN[$tag]:-}" ]; then
+		printf 'session_hardening=session.serialize_handler-mismatch\nbase=%s\ndate=%s\n' \
+			"$target" "$(date '+%F %T')" >"$prefix/$HARDEN_MARKER"
 	fi
 	[ -f "$prefix/src.tar.gz" ] && cp -f "$tarball" "$prefix/src.tar.gz"
 }
@@ -1106,7 +1205,9 @@ process_build() {
 	local build="$WORK_DIR/build-$tag" stage="$WORK_DIR/stage-$tag"
 	local tarball="$WORK_DIR/php-$target.tar.gz" label=$target staged built free
 	CUR_LOG="$LOG_DIR/php$tag-build-$RUN_ID.log"
-	[ "$mode" = backport ] && label="$target + 官方安全修補"
+	[ "$mode" = backport ] && label="$target + 安全修補"
+	[ "$mode" = harden ] && label="$target（重編以套用 session 硬化）"
+	[ -n "${PLAN_HARDEN[$tag]:-}" ] && [ "$mode" != harden ] && label="$label + session 硬化"
 	title "PHP $tag：$cur → $label"
 
 	free=$(free_mb "$SETUP_PATH")
@@ -1124,6 +1225,10 @@ process_build() {
 	fi
 	if [ "$mode" = backport ] && ! apply_backport "${target%.*}" "$build"; then
 		fail_version "$tag" "安全修補套用失敗"
+		return 1
+	fi
+	if [ -n "${PLAN_HARDEN[$tag]:-}" ] && ! apply_hardening "${target%.*}" "$build"; then
+		fail_version "$tag" "session 硬化補丁套用失敗"
 		return 1
 	fi
 	read_configure_args "$prefix" || { fail_version "$tag" "無法取得原本的編譯參數"; return 1; }
@@ -1155,6 +1260,9 @@ process_build() {
 	preflight_staged "$prefix" "$staged" || { fail_version "$tag" "新版本檢查未通過，已取消替換（線上版本沒有任何變動）"; return 1; }
 	backup_install "$tag" "$cur" || { fail_version "$tag" "備份失敗，已取消替換"; return 1; }
 
+	# Enable hardening in php.ini before the restart so reloaded workers pick it up
+	# (make install does not touch php.ini; the backup above covers rollback).
+	[ -n "${PLAN_HARDEN[$tag]:-}" ] && apply_harden_config "$(php_ini_path "$prefix")" 1
 	swap_install "$tag" "$prefix" "$staged" "$target"; local swap_rc=$?
 	if [ "$swap_rc" = 1 ]; then
 		fail_version "$tag" "新版本啟動驗證失敗，已自動還原為 $cur"
@@ -1162,19 +1270,23 @@ process_build() {
 	fi
 	finalize_install "$tag" "$prefix" "$target" "$mode" "$tarball"
 	rm -rf "$build" "$stage" "$tarball"
-	local manual=""
+	local manual="" hsfx=""
 	[ "$swap_rc" = 3 ] && manual="（請手動重啟 PHP-FPM 讓修補生效）"
-	if [ "$mode" = backport ]; then
+	[ -n "${PLAN_HARDEN[$tag]:-}" ] && hsfx="＋session 硬化"
+	if [ "$mode" = harden ]; then
+		ok "PHP $tag 已重新編譯並套用 session 硬化$manual"
+		set_result "$tag" patched "$target" "已套用 session 硬化$manual"
+	elif [ "$mode" = backport ]; then
 		if [ -n "${BACKPORT_OFFICIAL[${target%.*}]:-}" ]; then
-			ok "PHP $tag 已更新為 $target 並套用官方安全修補$manual"
-			set_result "$tag" patched "$target" "已套用官方安全修補$manual"
+			ok "PHP $tag 已更新為 $target 並套用官方安全修補$hsfx$manual"
+			set_result "$tag" patched "$target" "已套用官方安全修補$hsfx$manual"
 		else
-			ok "PHP $tag 已重新編譯並套用安全修補（本專案移植，非官方）$manual"
-			set_result "$tag" patched "$target" "已套用安全修補（本專案移植）$manual"
+			ok "PHP $tag 已重新編譯並套用安全修補（本專案移植，非官方）$hsfx$manual"
+			set_result "$tag" patched "$target" "已套用安全修補（本專案移植）$hsfx$manual"
 		fi
 	else
-		ok "PHP $tag 已升級為 $target$manual"
-		set_result "$tag" upgraded "$target" "已升級$manual"
+		ok "PHP $tag 已升級為 $target$hsfx$manual"
+		set_result "$tag" upgraded "$target" "已升級$hsfx$manual"
 	fi
 }
 
@@ -1272,6 +1384,13 @@ print_summary() {
 		printf '  %-20s%s\n' "${INSTALL_LABEL[$tag]}" "${sites:+  使用中的網站：$sites}"
 	done
 
+	if [ "$HARDEN" = 1 ]; then
+		printf '\n%sSession 硬化提醒：%s\n' "$C_YELLOW" "$C_RESET"
+		printf '  • 已開啟 session.harden（停用 session 物件反序列化）。若有應用把物件存進 session 會受影響，請測試。\n'
+		printf '  • 請一併移除各網站 .user.ini / .htaccess / FPM pool 中對 session.serialize_handler 的覆寫，全站統一為 php_serialize。\n'
+		printf '  • 登入後呼叫 session_regenerate_id(true) 屬應用層，請自行在程式碼落實。\n'
+	fi
+
 	if [ "$MAIN_LOG" != /dev/null ]; then
 		printf '\n'
 		info "備份目錄：$BACKUP_DIR"
@@ -1327,6 +1446,7 @@ main() {
 		warn "沒有符合 --only 條件的 PHP"
 		finish 0
 	fi
+	[ "$HARDEN" = 1 ] && apply_harden_plan
 	print_plan
 
 	local advise=0
@@ -1334,9 +1454,11 @@ main() {
 		case "${PLAN_ACTION[$tag]}" in
 			upgrade) builds=$((builds + 1)) pending=1 ;;
 			backport) builds=$((builds + 1)) pending=1 need_patch=1 ;;
+			harden) builds=$((builds + 1)) pending=1 need_patch=1 ;;
 			mitigate) pending=1 ;;
 			distro|warn) advise=1 ;;
 		esac
+		[ -n "${PLAN_HARDEN[$tag]:-}" ] && need_patch=1
 	done
 
 	if [ "$CHECK_ONLY" = 1 ]; then
@@ -1379,11 +1501,13 @@ main() {
 	for tag in "${PLAN_TAGS[@]}"; do
 		action=${PLAN_ACTION[$tag]}
 		case "$action" in
-			upgrade|backport) process_build "$tag" "$action" ;;
+			upgrade|backport|harden) process_build "$tag" "$action" ;;
 			mitigate) process_mitigation "$tag" ;;
 			ok) set_result "$tag" ok "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			mitigated) set_result "$tag" mitigated "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
-			distro) set_result "$tag" distro "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
+			distro)
+				[ "$HARDEN" = 1 ] && apply_harden_config "$(php_ini_path "${INSTALL_PREFIX[$tag]}")" 0
+				set_result "$tag" distro "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			warn) set_result "$tag" warn "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			*) set_result "$tag" skip "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 		esac
@@ -2512,6 +2636,362 @@ FPE4Pbu2MEg8dyXg0P9Qehpk84uT+WRfUOl/5mGCrLFx8/w108UeSIGImvK9ofwEkniTU7xtmVVB
 P4DloFAXhX6zGmJuldSIahoW6pBqE08SmzeQVuJuE/riyw2k4TN8woyxVH4EAH7BEipsXJcIRO+B
 KoDCCvwCFMl3IQX0hTMRK9utbMIWDKMMSpgGQJYDJpd0+ggw+CQTkKKskloW1aookJGQ+k0wYX91
 lr3hev0cFME1FaXYMHtX9KtYIv8fs3551YjCAAA=
+BLOB
+		;;
+	esac
+}
+
+# Opt-in session hardening patches (hardening/php-<branch>-session-hardening.patch).
+harden_blob() {
+	case "$1" in
+	5.4) cat <<'BLOB'
+H4sIAAAAAAAC/6VV72/aMBD9DH/FjUnlRxICW1umsVbQgtRKFKpCK1XTZIXEkAwTZ06oStf+7zsn
+xKQUQavlA3bs9x7Pd+eLYRhgmfQxMkMahh73zcANyGpedfOapsF4x36rBUa9cagfgyaHBrRaeciF
+c0tEJIwEiIld/3bcIL41p03Ax6xAyl4EjFsOCQSfClyqSgxUTOQz7k8VdSLon5gKe/gSmPAdvhgz
+qhTmnq9UdvBTmNTQck/Ud8iYcwauJRzqry1kNZK97xBavhd5TxQ2RGFGl1Di49/UjgxELqFvtuEH
+XF9cQ6NaK8d+X0AGNQjJlPGxxcJmHvIQLQPq0MnGFsS2slDjTQZTb/aW7K33ZOYahw2ZOTmsMjcc
+dQh6I5f9S3I2GPS67X6poEiczzxK3CgKuM+WBR2gIH/SJyW2ez0dBv5t4FgRPcMQSswGOaa9Pluy
+pF7L++wsQkoS1TB1Uahn/Oy0kyErxv/bkSfLePqYnSxZ329H220nqcxseqBQ22JneD8cda/eOkr4
+WfoHA9Ttj27u134EnVBBBbFdas9UvvaWzzASnj/VAYuYCp+sVWb6XjufvQlctO+6pNO9I7c37X5n
+cLXbJPUjwYMlmXiMKmsF06EP5kJYvsPn7zeckdLfFz95Jb8c1eNuiuORXv+a3Er5qJ5KrCDAJsBK
+B2mTMU6xy+hwPSylHS/AOHmP5aq9dZVRv9x8t2wFT2UZpw8WW+BB4oFsV6htcBGixRDMQwl9JCVV
+hoMDeIWr2mX4u4LmbERBxZ3BySYoVcuF2GhJBC57g2GyYl1PISdcQMn1EFdr4jo2XpfJiaZl/jG2
+585+ut4vODmB4nMRnp8hs/CpWFavUCRFJf+ymrzIhh3P1nYwnHidI6yakISeg0yMgLzmaklFMPNJ
+JWmuqCWYLB7s9ggtqe/JaHhz1RuS83Nk/wMsPy7cvQcAAA==
+BLOB
+		;;
+	5.5) cat <<'BLOB'
+H4sIAAAAAAAC/61VYU/iQBD9rL9ijkuk0JaCJmiO04BKogmCETQxl8umtIvtUXbrblHx9L/fbKFl
+Rc7D5PbLbmffTN++mZ21bRtchz4ljqRShpw5cRCTxboSbJumCcMP9ptNsGsHVasOppr2odnchi2f
+T4cRBTHyagf1fTIJGRkJet8AAKcMmfc0jrjrk1jwO4GmSgaDsrMNGOWZMp8MOY9gKimRiQi9hEy4
+TxsqymNAk4AK4AIYT+Dy7BJcz6NxImHKxow/suxHEPpSxTS1iIErfMoUocXQeM33voF0WZiEzxRW
+iMKYzsDgw1/US2xEzqDrtOB7SmG/Ui2l/F9BCRVLchfxoRvJhjpSMoupT0crW5DS0qH2u6xk3Lw1
+GVnuqWwcVNNsqGmRjf7glCA3ct49J8e9Xqfd6hqFPAkorcf5OKSyYM2lKNSyFY7MsdXpWNBj17Hv
+JvQYJVQQzTn3eHu21Lz8LG1Ch7NopnH6HB3d2fovdLTCU0QK1c/Q0ZytDdQxP6Yzr0zt/3+h07/t
+D9oX7xnN/XX3TwrU7g6ubpd8BB1RQQXxAuqN8/LR+a0VqI+isDsLsIipYGQZZWz9k87XcARnrZs2
+OW3fkOurVve0d/ExScoSweMZGYURzakVHJ8+OFPhMp9PNieshbI2009dyd16fVfdSZz3rNre/Faq
+ISeuSFSNEDeOsQlExk7WZOwj7DIWXPaNrIvGqFP4VKp4a60RZaXGxmHLeCrXPnpwoykeJJ3I+gjV
+FV+EmCkE82Agj3lJlWBnB97gKl4Jfi+gWx6ioByM4XAVlEXbkthoSQJB9A4TqYoNwhw5wo5vBCHi
+qg20Y+MNIrUwTe2PKb1g/CMIf8LhIRRfivDyAprhS7GUf0KRFPPwr4vFa/oGqbGkg3Jid0mwaiSR
+oY+eqIC65rkpV1B7JkmWK+qKSBUPdnuEGvl7MuhfXXT65OQEvf8AgFucYJEHAAA=
+BLOB
+		;;
+	5.6) cat <<'BLOB'
+H4sIAAAAAAAC/61VbU/bMBD+XH7FrZPoS5KmZRpF65gotBJIfUG0ICGErDRxG6+pndkpUAb/fee0
+SQN0rEjzFzuXu8ePnzufLcsCx6YPka2oUkxwO/RDslpX/B3DMGD0zv+jI7BqB1VzHww91eHoaAdy
+npiPAgpy7NYO9utkxjgZS/qrAQB2GZLoeRgIxyOhFBOJpkriBmV7BxDlkXKPjIQIYK4oUZFkbkRm
+wqMNjXLv08inEoQELiI4Pz0Hx3VpGCmY8ykX9zzZCJinNKaRQfQd6VGuCa1Ghtfy3zdQDmcRe6Tw
+iihM6QKKYvSTupGFngvo2U34HlOoV6qlmH9uzhWbcOqBi3gJNvGcyCG+o/yb2v5tfI4R445cQLf1
+FbQdAsonkR9jPIMWO1RkEoiRE6gGymK9SVhC292QrPU/naiDak0nSk+rRA2GLYK0yVnvjBz3+512
+s1fMp/lB1V0hpoyqvLlUKV9LVjiSwGanY0KfX4Z4OHqM6mqXTHAa8fI0sXn9WdqGjuDBIsPpY3Sy
+weZ/oZOpSU0kX/0InUywuYU6xvt0lkWb2f8vdAbXg2G7+5bRMj4b/kGB2r3hxfWaj6RjKqkkrk/d
+aVo+WX4bBRqgKHxiAhYxlZysUabmP+l8ZmM4bV61Sat9RS4vmr1Wv/s+ScojKcIFGbOAptTytkfv
+7Ll0uCdm2xPOQJnb6aev5F69Ft9JnPfM2pflrdRDzRwZ6RohThhi2wqKu0n/sX5gAzLhfFBMGmyI
+OrGHUsXdaMWOUmpsDVvWLcr6cecEczxIPJHNCNVXsehixC6YhyLyWJZUCXZ34YVfxS3B75VrLu6O
+ZX8Kh6+dErScwh5MIvCDNz6BrlifpZ5jfAyKPkO/agPt2JP9QC8MI7NjTM+f3vjsFg4PofBUgKcn
+yBg+FUrpJxRIIYV/Xi2e4+dJjzUdlBO7S4RVo4hiHkaiAvqap6ZUwcwLSpJcUUcGunjwfULXYvrU
+DAcX3c6AnJxg9B93YiaMrAcAAA==
+BLOB
+		;;
+	7.0) cat <<'BLOB'
+H4sIAAAAAAAC/9VXa2/iOBT9DL/iTleiCQkDaUfTdtjZLdOyaiUGENBKndXKColpsoQka5t2aIf/
+vtd2kqYPuq3UlXb5QB6+9/jkHPvabjQa4Dbpd9HklPMwiZtpkJLs/n1QtSwLps+0Hx5CY8dp2R/B
+kpd9ODysQuWGxj6ZJkkES04JFyz0BFkkPm1Dsw7XARUBZZAwiBMBw5MhuJ5HU8FhGc/j5DqGrAMI
+fQ715j3EyL1ZkWsWCg2WLEJRhKvXEh8zBYQc0gQbphEtgUg28SXUsxxy5TKukDhloRuFN9RHZuFl
+GLtRAey7wpUYVtUqUQlc5tO4DcVPoWTSqLZPgH8rSKZ/Uk/gfd6HKySqBdyNQ4FdwjKNEtcnKUsu
+GSLAnK4U5zVIvVNOLqNk6ka8XYUqiFVKfTp70ASKWDm08cjcnJ33hLF3bdLU/Q/70lR52dOmjifH
+BL0ip/1T8mUw6HU7fWMrT5I+e0kyDynfsrUYW05+h788sdPr2TCIz1JUlH5BEWVIKbnIuP9t6vXd
+o/kSOkkcrUqcXkennGy/CZ3SLJBEtlqvoVNKtl+gjvU8HT02S/1voDO+GE+6Xx8y0tnl5FfK0+1P
+Rhd3bBidUUYZ8QLqzYvBU2b3pDxjNY9twCFMWUzuUOb2P9L5KZzBSee8S4675+Rs1OkfD74+T5LG
+giXpiszCiBbUtpo+vWoumRv7yeLlhEtQ9sv0kxPyoOXICXnQ2rEdR83IdVUWnPV6rSpF1cKHMZqD
+9YsuUrECN4qSa+o3vMjl+B1YmsQnWLhzdavr2jIuqh6ggjjUgF5RtqpaUAeVB4YuXhym1EsWFIiW
+KMaHNKKCkiMZZtoQ06VgCMVleS1gSYDqRJQpxEXIF67wgrwghrG8SH2hg2Q9VAmLb+xRbIGvqODk
+vaq6XGDB9ODE5cHEVeW8tAqROCH5J36G/lmv18Y6DcMxGXdHp53e6bfuCI0+Ghx3yW9n/SND52b8
+TKnh7e2t0vAWB4GXxFyAh0JCHQtqKhiiXuFaYMn/COu9tsNxcLWzDpw9+0C5ganfzjs9IgkYtfLq
+YmLRrkjRzjsjctYvWMkhMjEwAjXiAUY1Klj7l5HADiVH2VIyyMD2yj1gGwzNFqPCyxi107TrZg2p
+bmo19VfZUCt1bT3bNaHfDQz5d3q3JbIxHBu6sJhQq8HT9prw64YW+KSM36j0cXc8GQ0uymJDBYuA
+8U5/tqmsr9wgcYLsiC8S9shEabvTwmm4BxZe9/PdjgJCVIyLljSDUlhQ95aM4YS3gV211evshRpT
+jIiF0tqo3RsFGvGpIVDAbZIeaulG5eGx8ZKstbk/6fsbd6ncrryZ4bnaeu4NJyOjxq5syEibWnPt
+NJ+HaRFe0bCClDw2YneBFVkBlA1RvjuZ707r4L/oe+2vV0z3t3D9NR3+Tz3f2dvdUQebvQ+O7bSU
+6bf5MUJxInItX4FH5bbc0l1u+iolOW4IBkfkpDM+mXS+9LrGhmBZj3U3kg4J8ZCwIdSGlq1Uyf8d
+lbzOaTJ6GXLcIBF3KZJsQ2GUzkEaewuXyvH4dNDHTQzHEZDMSq9MaIAjgYu+THUKqSxWckO6jCiJ
+l4splevkvWet4m5Lb1x2W84H29nNpg7+cCvAhKRB3DRFRtyo5cefxi94/rFxCTfYzHP2P+7hwYjO
+wu9mbu6j5OhRcl2e2Rq/qLlpg7oQXL2fQGg9yNXyZ0PowZAtx73PXZU/PfaDOYrwDdcaXIF6xsPo
+HLciNSYCgiiP7nX7j6Jxpx0WGTM8LBtBiPGtNr6HnzFZ3lhWiYMuSPPfg/AP+PwZtn9sw48fUHrx
+btssHmGbbBfw6+xmrYxVc6VggwLjWQi3djEnPPQxszMc9i7IBPfNuMc6PW7fm156hOa+UZdFcqsr
+B1zoF9+IUvwNEeBtaHoQAAA=
+BLOB
+		;;
+	7.1) cat <<'BLOB'
+H4sIAAAAAAAC/91WUVPiSBB+hl/R64MmJCjgLuJ6bonKllSxYAlulV5dTQ1hMLOESSozqKjcb7+e
+CYlR0dLae7nLA2Qy/fV883VPT5fLZaBb7FZtSSYlD8VW5Edk+b7pFx3HgeEb8wcHUK5V6m4dHP3X
+gIODIhTumBiRYRgGENC7ObmJuWJ7sFWCcMoVLNFgPsONzwTgVy4hCnFiGDAobT1xwgWR9JoRn4pR
+wGLjSSqKYOVTRI4zl+iEC9DGsDSGMAYRqpxLqWIurqC0xJBrGsvEJYs5DfgdGyGIX3FBg8zxiCqq
+fThFJ0fMp/GIiT3IHuNlqY2Z+wr4M4dw+It5Ct/TNajSXh2kKrjCJWEWBSEdkSgOr2L0ABM2N5wX
+oAWPJLkKwiEN5F4RiqDmERux8bMpMMTypuUX0U3ZeSsi+zino7pTq+mo6r+dJKr9wTE5PTkl7W6b
+HPZ6nVaza62loJlkxAvDCWdyzU3EWKumb/ikwGan40JPnEeoKDtEEbVJDpwhnu7NfH4c2u+hE4pg
+nuP0MTp5sPuv0NF55ykyDUdME1mrfIRODuy+Qx3nbTpJbubWf4VO/6I/aP14zihB58EflKfVHZxd
+PLKJ2ZjFLCaez7xJljx5divl6Ztz7AKmMIsFefQycX+LjkeRCAk4lioWZ3REaL6b8Zt0nsDd31cn
+8cduIx6zTJO1auMxXivpdEJNBiAPd98XLHP665/N6a9/cavV5PjHTM1iAcPZeFNXoUVRV7vFYrEs
+izjoY2Zg8WTTSM2BBkF4w0ZlL6AS94J1UX2FKZ2Y16SozkRWcgHDh3kO7JrF86IDJTA4sJLKKWHI
+vHDKgCQyCRxEAVOMHGkz2wXBZipGV1LX9sxtemUYj1Mup1R5flqNudB/WmNoIlkPVcPKLzym75Af
+qOhg0+xNXzXcgxMq/QE111PuDiQiJOkW96F73umYCn3aJ/3WWbvZaV+2zshx66h33CLfz7tHVoJd
+8rO1hvf396bU3yfK73wxyjeq7q4RHqW//NnsEO3bWs/fWjYuVdB6/GyekfNutqDOhoGFFrh96aOV
+U8A70jrtW8nRtWF9HVbvwUYWTqGgJzU+FyE0VmQZ1NQ6W8N9zZ1ee2GSR84ChQqt8GzhfOHJxlyw
+vFBIpTOEXwkMi4fMoVSy169p8NqsjddfpPDMree2vlqg41Z/cNa7yGuktW9s72jtG5/rS+2NEHkR
+dB9AFKQ4E+v/RgiQ5xh7ISvCIKCIexDBH5Aotgd6TQyCoFMWYDu2D5b1RFzbKkU2cgbrb8zsw3YX
+93rc+r6UbbdW1bLtbm//L2VLFcOBaXfrSWdUq2O2VCtmw/dpc2nQhAkVz8FjGpLs4NObpLFy947I
+SbN/MmgedlrWG5SSZTRzwrF1fMXUhYprilH6W81OosHH7IpLvJ8InalwWfmtXHec+F7DGtbvt3td
+vGokChmOc59sKENVO87WspOwTue6TZkFjIjZdIgd+D48GSc5U2vsmqSp7VYrbnU7SRv9YI2OlaZB
+aBQhI2mtp01x+Rt2xS7WVisee9VGfQfbZTbmt7Y556vAwQtwSadi+RvGc4b3ofkjmPIrPFSeYRP5
+8VmRkXm7zTSq+kkqkz9BES6x5GC+d6zn1qnfgtYYT4kfpNadVveFNfZfPEOYE+1ztK/s4Xc80X6g
+Xxwnx8EQ9id/+vwv2N+HjYcNeHiA3IdPG3Y2hA2ykblfLF+Sc6CfRzYoMHbIeOcKSSQfIbJ5etq5
+IIOzZhcvv/Zxqmg+Q9O4MRojeMx1wvFRtkeU4h9RTGEekQ4AAA==
+BLOB
+		;;
+	7.2) cat <<'BLOB'
+H4sIAAAAAAAC/91W33PaOBB+hr9iy0NiY0P4HVKunZKEXpihkAmkN8nNjcbYAutibI8t0pI097ff
+SsLGJJDk9c4PYMm7n3a//bSSw2YzKJXmjIN1RH/yo5jGMQv8o9ANyfq97MJ0/7c88x36E1rtVqt5
+XCmX681pozKrQ7VSaTUa+VKp9Bpy3jCMV9G/fIFSrXJstsAQf8eAE3wVUofOIObR0uZAhEcYk7kX
+TC0vhsc85B6o75BpEHjAfBJb95S4lu94NOrAUREdLU6BIYJaB1iMdiDsYG0HQQR+wKF4tIUWU75B
+Es8utEXgLD2cEdac+fP9mJiB+F5ce5J7K4pVhDRilsceqINObM58y0vhHYtbAsPIxOVakUN9FVIa
+V0Ki/PYR8GcFwfRvipw5NFnB4gLTwOR9xnFBWIZeYDkkjIJ5hAhwR1cy4ifY5rmTh3xaimclkIFl
+TZ19OkuCtJ+pIJ1f66vZcGzabJTLtWmlUrdq+/W18Xyprc03oat2tS50Jf6kri4vLkl/2Cenvd/7
+Q03HIiUzveHk6kYrJO4xc4hH/Tl3CyZkn0K9tplJnLuDgQkj/zrEwtExcwbS8w34KeMxCWlEbCyf
+ZXMaIXChkVlvH/wpegrw8eScpBmNRoNed7hZwrMeVuRHxDhNEQvVt8AH6PSH8FF2G4yN37YO5Pxm
+qKNkX41KKXWL00JlR1Tjm/Gk920T2ClugcRKYWyX5Y2oUMc53C/XUviQCl9u01fjfbZVytS3ph51
+CqaSV+NEyqtZMatVqa8xGfeu+t1B/7Z3hUU/G533yNfr4Zmmet56y+ti8z4+Pqpdlxejp6cnOcob
+OBhjitgX6CLkK7A8L/hBnZLtWTGGJVrOR1hYd/JV9Yuln0JDRGfLmAK9p9Eqb0ARpB9oqi3EMKV2
+sKBAVM4+DkKPckrOhJlugk+XPEKoWLStFDZpiRJxweKFxW03aTXMF3+CLuhisDbWC5uab1PRcr8h
+r5Oy7GaijTIbLqzYnQgaoZg5CYgfkCTFTzC8Hgw6eSP/jNHz3nsYFceDHfgxB7G1oIitKuQRot5j
+jzXEL27tjqpgU1Ww1TRPXhbwfcvharffuwMiYtYOso1e76xbwPfuFbkepshCaxMNLZDW2EUrI4eH
+i3Y51pS2dTg4gN3c6JidkcuJj8I/U3kiTq61WBLrdA1zH5xYGxWYQ3UvPY4c7UDW8HtuKzETNEUw
+WrG5j+VWTBf1A2R331ddFcKEg0zquwk6740nV6ObLEeiXCdVeU84qbXeU64pHqrRaqtWuQehgaK9
+jCLqcxOie3nI/TeKhHHO8IKhhUrKHQjhN1CcdkCXss/51oKiutFC07bo17ViqGPMoP2DrJ32h5jr
+ee9rQmy7LYjFI7fyDmb/V5QmbOJAXkXbDXlnqLWb7XVXX/ctkZDsZpKHSX801NbAL7qPvB3JpQhy
+Eq3ApgJfpfvh1QzxPB6dkYvu+GLSPR30tFfiV8uINAnDq90eUxMqpuynyW91nbyRBBrROYvx/kGs
+JQ/Wh6aWub0q9AIKYjzGrPG4jpH3YJaZ0qEEVQGdrqYrFSxWRF2Wib9cTKnowltjJb96tVoTpNer
+9ZpZrWdIZz7fKmE0s6vt1jGxseJTy77biFxY4qknJHgfMAfbvhgQcZcWM2Jz4IMnV8RFXsQKQ0wx
+1g6Sw730GS/CJipfSxYJ8TBlP3XZpXY5ey+ci2K50mfU0xLvTPJP3CN3IFSe+aqK4rNjR2TtyolQ
+xKP6qnuHrN5iw8T9NtCeWye4OVE0wsH1EutBb/jC2gSXpR6y27gM7SsdnMdu43rixTAyMciA3bs/
+XfYXfPoEh78O4dcvyEx8ONTTIRySwxT+af2i9qF4NtEgwd6K4E3EjwneltGze3k5uCGTq+4QW1P/
+PGF0lzioFaHzjAkFMyfNEan4F0vK7FwODwAA
+BLOB
+		;;
+	7.3) cat <<'BLOB'
+H4sIAAAAAAAC/91WUXPaOBB+hl+x5SGxsSEYCAnl2ilJ6IUZCplAepPe3GiELbAuxvbYJi1Jc7/9
+VhI2JoE0r3d+AEve/bT77aeVHD6bQaUy5wnQI/YjOYpZHPPAPwrdkKzfqy5M938rct9hP6BmWW16
+0q5W6+1Gu1lvgFWrtZrNYqVSeQ25aBjGq+ifPkGlXmuZLTDE3wngRLIKmcNmECfR0k6ACI8wJnMv
+mFIvhsciFB6Y75BpEHjAfRLTe0Zc6jseizpwVEZHmjDgiKDWAR6jHQg7WNtBEIEfJFA+2kKLWbJB
+Es8utEXgLD2cEdYJ9+f7MTED8b289iT3NIpVhCzi1OMPzEEnPuc+9TJ4hyZUYBi5uFwaOcxXIWVx
+pSTKb+8Bf1YQTP9myJnD0hVoIjANTN7nCS4Iy9ALqEPCKJhHiAB3bCUjfoJtnjtFKGaleFYCGVje
+1NmnszRI+5kKsvm1vo7r07ZDG9XqcdNp0ePafn1tPF9qa/NN6OrUaghdiT+pq6vLK9If9slZ7/f+
+UNOxSOlMbzi5vtVKqXvMHeIxf564JRPyT6lR38ykzt3BwISRfxNi4diYOwPp+Qv4KU9iErKI2Fg+
+aicsQuBSM7fePvgz9BTg48kFyTIajQa97nCzhEcfVuR7xBOWIZasX4EP0OkP4aPsNhgbv20dyPnN
+UEfJvhqVUuoWp6XajqjGt+NJ78smsDPcAqmVwtguyy+iQh0XcL/cSOFDJny5TV+N99lWqTKfTj3m
+lEwlr2Zbyuu4ZlqW1NeYjHvX/e6g/613jUU/H130yOeb4bmmet56y+ti8z4+PqpdVxSjp6cnOSoa
+OBhjitgX2CJMVkA9L/jOnIrt0RjDEi3nPSzonXxV/WLpZ9AQsdkyZsDuWbQqGlAG6QeaagsxTJkd
+LBgQlbOPg9BjCSPnwkw3wWfLJEKoWLStDDZtiRJxweMFTWw3bTXcF3+CLuhisDbWC5uabzPRcr8g
+r5Oq7GaijXIbLmnsTgSNUM6dBMQPSJriBxjeDAadolF8xuhF7y2MiuPBDvw4AbG1oIytKkwiRL3H
+HmuIX9zaHVXBY1XB1rHZflnAty2Hq3372h0QEbN2kG/0emfdAr52r8nNMEMWWptoaIG0xi5aGQU8
+XLSrsaa0rcPBAezmRsfsjEJBfBT+ucoTcXKtxZJaZ2uY++DE2qjAAqp76SXI0Q5kDb8XthIzQVME
+oxWf+1huxXRZP0B2933VVSFMOMilvpugi954cj26zXMkytW2TkS52vXWW8o1xUM1Wm3VqvAgNFC2
+l1HE/MSE6F4ecv+NImGcM7xgaKGScgdC+A0Upx3QpewLPl0wVDdaaNoW/bpWDnWMGbR/kLWz/hBz
+veh9Tok9PRXE4pFbewOz/ytKUzZxIK+i7Ya8M9TbzdN1V1/3LZGQ7GaSh0l/NNTWwC+6j7wdyaUI
+chKtwGYCX6X77tUM8TwenZPL7vhy0j0b9LRX4lfLiDQJx6vdHlMTaqbsp+mvtU7eSAON2JzHeP8g
+dJkE60NTy91eJTr+oAmqSSuhMsZjTB/P7RgLEMxyUzpUwBJrZMvqSg6LFVG3ZuIvF1Mm2vHWWOmw
+Ua9Zgv1GvW6ZViPHPi6/VctoZlunrRNiY+mn1L7bqF1Y4vEntHgfcAf7vxgQcakWM2KX4INHWJSI
+BAkNQ8w11g7SU77yEW/EJm4BLV0kxFOV/9Blu9rl7L1wLovlKh9RWEu8PMk/caHcgVB75qtKi8+O
+rZG3q6aKEY9qsO4dsvoNOyduvIH23DrFLYiikQRcL7Ue9IYvrE1weeYh247L0b7WwXlsO64nXgwj
+F4MM2L370+V/wYcPcPjzEH7+hNzEu0M9G8IhOczgn9YvakOKZxMNEuytCF5J/JjgtRk9u1dXg1sy
+ue4OsUf1L1JGd4mD0QidZ1xImTtZjkjFv6T0m9YXDwAA
+BLOB
+		;;
+	7.4) cat <<'BLOB'
+H4sIAAAAAAAC/91W33PaOBB+hr9iy0NiY0P4nVCunZKEXpihkAmkN8nNjcbYAutibI8t0pI097ff
+SsLGJJDk9c4PYMm7n3a//bSSw2YzKJXmjIN1RH/yo5jGMQv8o9ANyfq97MJ0/7c88x36Exr2cbs5
+c8rlRrtOm7UmVCuVVqORL5VKryHnDcN4Ff3LFyjVKnWzBYb4Owac4KuQOnQGMY+WNgciPMKYzL1g
+ankxPOYh90B9h0yDwAPmk9i6p8S1fMejUQeOiuhocQoMEdQ6wGK0A2EHazsIIvADDsWjLbSY8g2S
+eHahLQJn6eGMsObMn+/HxAzE9+Lak9xbUawipBGzPPZAHXRic+ZbXgrvWNwSGEYmLteKHOqrkNK4
+EhLlt4+APysIpn9T5MyhyQoWF5gGJu8zjgvCMvQCyyFhFMwjRIA7upIRP8E2z5085NNSPCuBDCxr
+6uzTWRKk/UwF6fxaXyezactxauVyu1GZHbfr+/W18Xyprc03oauTqtSV+JO6ury4JP1hn5z2fu8P
+NR2LlMz0hpOrG62QuMfMIR7159wtmJB9CvXaZiZx7g4GJoz86xALR8fMGUjPN+CnjMckpBGxsXyW
+zWmEwIVGZr198KfoKcDHk3OSZjQaDXrd4WYJz3pYkR8R4zRFLFTfAh+g0x/CR9ltMDZ+2zqQ85uh
+jpJ9NSql1C1OC5UdUY1vxpPet01gp7gFEiuFsV2WN6JCHedwv1xL4UMqfLlNX4332VYpU9+aetQp
+mEpejbaUV7NiVqtSX2My7l31u4P+be8Ki342Ou+Rr9fDM031vPWW18XmfXx8VLsuL0ZPT09ylDdw
+MMYUsS/QRchXYHle8IM6JduzYgxLtJyPsLDu5KvqF0s/hYaIzpYxBXpPo1XegCJIP9BUW4hhSu1g
+QYGonH0chB7llJwJM90Eny55hFCxaFspbNISJeKCxQuL227Sapgv/gRd0MVgbawXNjXfpqLlfkNe
+J2XZzUQbZTZcWLE7ETRCMXMSED8gSYqfYHg9GHTyRv4Zo+e99zAqjgc78GMOYmtBEVtVyCNEvcce
+a4hf3NodVcGmqmCrabZfFvB9y+Fqt9+7AyJi1g6yjV7vrFvA9+4VuR6myEJrEw0tkNbYRSsjh4eL
+djnWlLZ1ODiA3dzomJ2Ry4mPwj9TeSJOrrVYEut0DXMfnFgbFZhDdS89jhztQNbwe24rMRM0RTBa
+sbmP5VZMF/UDZHffV10VwoSDTOq7CTrvjSdXo5ssR6Jc7eqxKFe71npPuaZ4qEarrVrlHoQGivYy
+iqjPTYju5SH33ygSxjnDC4YWKil3IITfQHHaAV3KPudbC4rqRgtN26Jf14qhjjGD9g+ydtofYq7n
+va8JsScnglg8civvYPZ/RWnCJg7kVbTdkBqrtVu1dVdf9y2RkOxmkodJfzTU1sAvuo+8HcmlCHIS
+rcCmAl+l++HVDPE8Hp2Ri+74YtI9HfS0V+JXy4g0CcOr3R5TEyqm7KfJb3WdvJEEGtE5i/H+Qawl
+D9aHppa5vUp0/EETVJNWQGWMx5g+ntsxFiCYZaZ0KEFVrJEuqys5LFZE3ZqJv1xMqWjHW2Olw3qt
+2hTs12v1plmtZ9jH5bdqGc3s6knrmNhY+qll323ULizx+BNavA+Yg/1fDIi4VIsZsUvwwSMs4iJB
+YoUh5hprB8kpX/qMN2ITt4CWLBLiqcp+6rJd7XL2XjgXxXKlzyisJV6e5J+4UO5AqDzzVaXFZ8fW
+yNqVE8WIRzVY9w5ZvcXOiRtvoD23TnBzomiEg+sl1oPe8IW1CS5LPWTbcRnaVzo4j23H9cSLYWRi
+kAG7d3+67C/49AkOfx3Cr1+QmfhwqKdDOCSHKfzT+kVtSPFsokGCvRXBK4kfE7w2o2f38nJwQyZX
+3SH2qP55wugucVArQucZE1JmTpojUvEv1VGm4BcPAAA=
+BLOB
+		;;
+	8.0) cat <<'BLOB'
+H4sIAAAAAAAC/91WbVPbOBD+nPyKbT6AnTjgQHkrR4cA6ZAZN2FI6A29udEothKrOLLHUmgDzf32
+W8mx49BAP9/5g9+0++zusy9Ss9kEust+qF3JpOSx2E3ChCzfd8Jqo9GA0Rvr5+fQ3HNbziE09OMI
+zs+rUHliIiCjOI6ACyLpIyMhFUHE0lPYrYNUVDHgY1jCAJcoB1oOlnIQpyBiBfXdNTTJ1ApJX5vQ
+pnEwi/CPllZcTF7HlCrV6/WlJnmkqcw8ZCmnEX9iASrxCRc0KuADqqjGaJT8CmkaMJG5tLoM0JIo
+I/AB8DaHePSN+QrfczNUaeAGMiC4QqswS6KYBiRJ40mKCPDA5sbtBWj2E0kmUTyikTytQhXUPGEB
+G79YAuNdWbT5S6pz7/wNaV6t6RQft/Z1ivVjmeKb6xvS7XVJpze8vbdqubjkAYmYmKiw5qyRUdvf
+W/3Jldue50Bf3CVIKhvwwDOa9tvwI64kSVhKfGSV+oqlCFx7X7L3GvwFamrwwfCK5DIX/b7XafdW
+JiL6NCffU65YgVhr/Q7cQ6U/tU4mt8JY6a2nx/xffdpYTm96lRXQGqc1d4NXg/vBsPN55dgFlmcu
+lWGsp+U3XmF5VbCM70w9QlGPpoXe9PdFBe8wQUcRC2pOVk7vj005vT9xWq2snlKmZqmA0Wy8o8t6
+UdXts1gsTKtVG/gxQP+xIdk0UXOgURR/Z0HTj6hEm7rXP8CUPpjXrFFnomhjSNl4JhmwR5bOqw2o
+g9EDK2tFCSPmx1MGJAtI4EcSMcXIpRazHRBsplKEknpeFLD5LDKIUy6nVPlh3t5c6IfmAtrorI/J
+wGkifKZn3WckbbhjYtPzi/twTWU41BxBvTRhiYhJHuIZ9O48z7T8zYAMOrfdttf92rklV53L/lWH
+fLrrXVqZ7tI/W3P4/Pxs8vWcMX9wYpg/PHBODPFI/dcvbY9obGurPAnt02UffmnfkrteYVAnfGih
+BIYvQ5RqVHD6WjcDKyswG7a2YHMMNnrRqFT0otYvZYjo0b5Mai5d2HBeg9O2F6Z45CxSyNAGZAvX
+K2uBOWD5sZBKVwifCEyLniRQr9tbjzR6bdXGeZqo1IGtUuibCbrqDIa3/fsyR5r7k9aR5v5k73DJ
+feUJ7UHdn6UpE8qB9NFk979BOvo5xh3VSpB2DOMUEvgDMo5OQdtE2gWdMtwNUMKy1ui0rXpio89g
+/YO1fNHtYaxXnU85UcdmPLRc1/2fMJWThB/mxHR04poj07F74LRcE+Jzfiox2gTDTOfgM62SRfDu
+TadxO+pfkuv24HrYvvA61hsuZWa054TjgeMVUQdcx0yc/N4q2s3op2zCJW6+hM5UvNwxrNKxymDj
+DUUw61YNJ9Zg0O33cNOSyGg8Lv2yoQktbaEwamf5nc5JdpwjYjYd4RnuDNa+s3rZdw9Mwey7R0dO
+az+rGH3hRE6V9ofQJEHXpLWV70jNj3iocnCSWunYbx0fHuFexcb8h226epNy9ItyXZ8Fmx8xsTPc
+6M1DH342ILgvdLM84LWhNMtyO3l69ZXNofABSfiKAwYL37NeSue4Fc0xURBGubTX6f0i7UDICw3T
+zSFHefcU/2M3h5F+aTRKPhiHw4e/Qv43nJ3B9s9t+PkTSj/ebdvFJ2yT7QJ+sXzJGkJfK2+Q4GhO
+cIcVkuARDzXbNzfePRnetnu41XWvckbLpZrnjdEUlcdcVx4PihiRin8Bb3OLnt0MAAA=
+BLOB
+		;;
+	8.1) cat <<'BLOB'
+H4sIAAAAAAAC/91WW1PiSBR+hl9xhgdNICio62Vcp0RlSqoyYAnOlrO11dUkDek1dFLpxhlU9rfv
+6c6F4KDzvJuH3Pqcr8/5zqVPs9kEust+qF3JpOSR2I2DmGTvO0G10WjA+J3183No7rXaziE09OMI
+zs+rUBlHUQhcEEkfGQmo8EOWnMJuHaSiigGfQIYAXKIcaDnI5CBKQEQK6rs5kGRqBaKvTUCzyJ+H
++EdLKy6mG+GemPCJVIler2ea5JEmMjWOJZyG/In5qMSnXNCwgPepohqjkZoU0MRnIrVmdRmMjBkj
+8BHwtoBo/DfzFL7nO1ClMRvot+AKN4R5HEbUJ3ESTRNEgAe2MBYvQdMdSzINozEN5WkVqqAWMfPZ
+5NUSGOfKos2fYptb522I62pNx/S4faBjqh9ZTG+ub0iv3yPd/uj23qrl4pL7JGRiqoKas0ZGbX9v
+9SdX7riuAwNxFyOfbMh912ja78OPuZIkZgnxkFXqKZYgcO2gtN9b8BeoqcGHoyuSy1wMBm63019t
+EdKnBfmecMUKxFr7V+AuKv2hdVK5FcZKbz085v/q08ZMeteqNIHWOK21Nlg1vB+Oul9Whl1geuZS
+KcZ6WH5hFaZXBdP4zuQjFPloqudde19l8A4TdBwyv+ak6XRwYtLpt5bTbqf5lDA1TwSM55MdndbL
+qi6f5XJpqqzawI8h2o+1yGaxWgANw+g785teSCXuqcv8I8zog3lNa3QuigqGhE3mkgF7ZMmi2oA6
+GD2w0lKUMGZeNGNAUocEfsQhU4xcajHbAcHmKkEoqVtFAZu3IYM443JGlRfk5c2FfmguoIPGehgM
+bCTCY7rDfUHSRjvGN926uAfXVAYjzRHUSy2ViIjkLp5B/851TcnfDMmwe9vruL1v3Vty1b0cXHXJ
+57v+pZXqZvbZmsPn52cTr+eU+cOWYf7w0DkxxCP13752XKKxra1yE7RPszr82rkld/1iQx3wkYUS
+6L4MUKpRwcZr3QytNMFs2NqCzT7YaEWjUtGLWr8UIaK7ehbUXLrYw3kLTu+9NMkj56FChjYgW7he
+WXPMAcuLhFQ6Q/hUYFh0J4F63d56pOFbqzb201glDmyVXN9M0FV3OLod3Jc50tyftI819yd7Rxn3
+lSfcD+rePEmYUA4kjya6/w3S0c4JHqZWjLSjG6cQw++QcnQKek+kXdAZw9MAJSxrjU7bqsc22gzW
+P5jLF70++nrV/ZwTdWzaQ7uFI8T/g6mcJPwwI9LR8Z6ZkY5Ojpx2KyvErBNon0x/MBU96g36Vob9
+qp5Txz686wueUoNLct0ZXo86F27XesfSdBzSDhGOc8gbog60HNOI8nu7qEKjn7Apl3gmEzpXUXaQ
+WKVBy2DjDUUwGawaNrLhEH3Es0wi0dGk9MuGJrT1DsWmdhr22YKkAx4R89kYp7ozWPtO02i/dWAm
+0f0WNr32fppI+sJGnShtD6FxjKZJays/qJqfcNZysMFaycRrHx8e4RHGJvyHbYp9k3L4k3JdT4fN
+TxjvOZ7/5qFnog0IrVe6aRzw2pCxZbmdPLz6SttT8IAkfMO+g/XgWq+lc9yK5pgoCMJc2u32f5J2
+IOCFhinygKN86xT/Y5EHoX5pNEo2GIODhz8D/hecncH2yza8vEDpx4dtu/iEbbJdwC+zl7RO9LWy
+BgkOFwQPXiEJTn6o2bm5ce/J6LbTxxOwd5UzWk7VPG6MJqg84TrzuF/4iFT8C1+W+qrlDAAA
+BLOB
+		;;
+	8.2) cat <<'BLOB'
+H4sIAAAAAAAC/61WbU/jOBD+TH/FLB8gbVJo4IAuHCsK2xNI3RaRchJ7Ollu4hJfUyeyE6AL/Pcb
+Oy8Nr+J2z1IbJ555/MyLZ9xut4Fusrt0UzGleCw2kzAhxXwjbNi2DZN31o+OoL3V+c3ZBVs/9uDo
+qAErP5gIiEolF9fQKoTJDZXqADZboJjkNOI/WACx5Ndc0AgKIQhoSqG12QBEmcRxBFwQOfXd7u4e
+yRJcZQeAA1FqPJ5JWE3gCmQmhNl/s2HnUCGVARNGvzYMocIcI7AP+LeAePIP81Ocl3RpqgnaoKjg
+KbKHLIliGpBExtcSEWDGFob6o+GWKHIdxRMaqQNtTbpIWMCmz5bAeKou2n4RkJKd/0owlms6EF13
+VwdCP4pAeOOv5Pz0nJwNz8jxaDTo94bWaqmUKUb8OJ5xplad3BmrbjnDUSr2BgMHRuLSONfLlY/R
+oVqyhlEpPjXRfF6+Nj/CKhbRokbtp1jVMZz/hZVOaD8l8zhgms9q5ydY1TCcD/jKfp9VnrA1Gm+w
+8q68cf/bkljJSI8cw3lyJv6Tr/rD8cXVkpNkUyaZJH7I/FmVV3WO7/nKM0XDAUxyJvFgV2Az55dY
++RT5kIjPOeJWrERsvpv3j7B6guL8uq9yPHaXcMkqD6263WUM32M1iDUngDqK87EImmqx4zqui+Vi
+Z8txP5t6AS3wMTNhThe6fm7AyBRBBVQySEMmsMYlKVAFJDdJ+PE8iVjKyElEldoHERsUmqWxLo7G
+ayKGTFRFn/g0iibUn5FpJnyzSsgtnbEswcIdS3yrSVtNJwcUgSawMExuJU9TJKNRENoPqbhmwYYp
+9VjOPUxp7C1snqQoH0XxLQvavubHFNb6dB/tm5lp3nNq2wEmHB5TYDdMLhq29ofWAysuHDFhaDF7
+w/wmWsOyVCKU0q1naTMyDCImDeKcqzlN/bDsMFzoh04H6CFZHwOMjVH4DFfgGwZ/nFumUuxAPpxS
+FY7pJGLQqrdAEZPSxEMYXg4GBw27AYXOTcyDJw2zHg+O7czSi/WPug+TFFrYtJG8CjGR7zGXtdV/
+9i7I5dDrX5z1Bmff+zo9x9ZSELvdCp+Cde5ZL3p3s2lQVvRuWqG+IwYGqVQOLYwxZXyJ7kAqM4Z7
+2CuP+Cv2yUtYE9bW4HWX6G3tt7ctcqSUrm/3Bp428hE7PXZ2cwPqul1zBepu7Tlux5ylyvnaZyaM
+5I/L4cn4bDS0CsSmvnzc39+bW8N9Yc+nd03AOjA6Iac973TcOx70rTf5oay5W2gzliF+KepAxzH5
+Uv67hXeLW5xk11xhtSP6SBcFxKrd7ww2/ulyzQJrlXh9z0MbsYIp9G88rX1qQhtcvUO1adPcjVbm
+C90Rs4gRkc0nTGIKP3k/MF7e7nze0l7edjs7jrud33D0wPMkU82H0CRBaspaKy9l7S94K3MAk6TM
+xASPOL9rmhC+phy9UG7pw9D+ckOjDOureZAI8+0lQueZbh4HHK8kal1uowyvHljOJLTCGTrhuze+
+wPM2sJ5Ll7gr2sd4TsOolB70hy+kHQh5pTHFEmuFHOU7B/gdfkdlPbHtGgdDOJz9FfK/4fAQ1h/W
+4eEBah8+rTerV1gn6xX8YzF5NIHVY8kGHYx3MqyPQhGFFekQeufngysyvugNPeKdfS09+trdnlGJ
+ylOuM48HlY3oin8B5wgJ6sQMAAA=
+BLOB
+		;;
+	8.3) cat <<'BLOB'
+H4sIAAAAAAAC/61WbU/jOBD+TH/FbD9A2qTQwGnLy7GisD1RqVsQKSexp5PlJi7xNXUiOwG6wH+/
+sfPS8Cpu9yy1ceKZx8+8eMadTgfoFrtLtxRTisdiKwkTUsw3w4Zt2zB9Z/3oCDrb3W3nM9j60YOj
+owas/WAiICqVXFxDuxAmN1SqA9hqg2KS04j/YAHEkl9zQSMohCCgKYX2VgMQZRrHEXBB5Mx3dz/3
+SJbgKjsAHIhS4/FMwmoBVyAzIcz+Ww07hwqpDJgw+rVhCBXmGIF9wL8lxNN/mJ/ivKRLU03QBkUF
+T5E9ZEkU04AkMr6WiABztjTUHw23RJHrKJ7SSB1oa9JlwgI2e7YExlN10c6LgJTs/FeCsVrTgdjd
+6elA6EcRCG/ylZyfnpPheEiOz85Gg/7YapZKmWLEj+M5Z6rp5M5ouuUMR6nYH40cOBOXxrlernyM
+DtWSNYxK8amJ5vPqtfURVrGIljVqP8WqjuH8L6x0QvspWcQB03ya3Z9gVcNwPuAr+31WecLWaLzB
+yrvyJoNvK2IlIz1yDOfJmfhPvhqMJxdXK06SzZhkkvgh8+dVXtU5vucrzxQNBzDJmcSDXYHNnV9i
+5VPkQyK+4IhbsRKx+W7eP8LqCYrz677K8dhdwiWrPNR0d1cxfI/VKNacAOoozsciaKpFb9txXSwX
+vR3H3TP1AtrgY2bCgi51/dyEM1MEFVDJIA2ZwBqXpEAVkNwk4ceLJGIpIycRVWofRGxQaJbGujga
+r4kYMlEVfeLTKJpSf05mmfDNKiG3dM6yBAt3LPGtJm21nBxQBJrA0jC5lTxNkYxGQWg/pOKaBZum
+1GM59zClsbewRZKifBTFtyzo+JofU1jr0320b26mec+pbQeYcHhMgd0wuWzY2h9aD6y4cMSUocXs
+DfNbaA3LUolQSreelc3IMIiYNIgLrhY09cOyw3ChHzodoI9kfQwwNkbhM1yBbxj8SW6ZSrED+XBK
+VTih04hBu94CRUxKEw9hfDkaHTTsBhQ6NzEPnjTMejw4tjNLL9Y/6j5MUmhj00byKsREvsdc1lb/
+2b8gl2NvcDHsj4bfBzo9J9ZKELvdGp+Bde5ZL3p3q2VQ1vRuWqG+IwYGqVQOLYwxZXyF7kAqM4Z7
+2GuP+Cv2yUtYC9bX4XWX6G3tt7ctcqSUrm/3Bp428hE7PXZ2cwPac7vmCrTn7jlu15ylyvnaZyaM
+5I/L8clkeDa2CsSWvnzc39+bW8N9Yc+nd03AOnB2Qk773umkfzwaWG/yQ1lzt9BmrEL8UtSBrmPy
+pfx3C+8WtzjJrrnCakf0kS4KiFW73xls/NPlmgVWk3gDz0MbsYIp9G88q31qQQdcvUO1acvcjdYW
+S90Rs4gRkS2mTGIKP3k/MF7ecXd/017ecfd6jruT33D0wPMkU82H0CRBaspaLy9lnS94K3MAk6TM
+xASPOL9rmRC+phy9UG7rw9D5ckOjDOureZAI8+0lQveZbh4HHK8kal1uswyvHljOJLTDOTrhuze5
+wPM2sp5Ll7hr2sd4TsOolB4Nxi+kHQh5pTHDEmuFHOW7B/gdfkdlPbHtGgdDOJz/FfK/4fAQNh42
+4OEBah8+bbSqV9ggGxX8YzF5NIHVY8UGHYx3MqyPQhGFFekQ+ufnoysyueiPPeINv5Yefe1uz6hE
+5RnXmceDykZ0xb+FlbvPxAwAAA==
+BLOB
+		;;
+	8.4) cat <<'BLOB'
+H4sIAAAAAAAC/61XbVPjNhD+TH7FHh8OJ3HATu6AQrkhcOnATC5hcOgM1+loFFvBahzbI9lADvjv
+XckvMSFJaa/6EMvy7urZZ1e7iscnE2iJdAB0jz0me5JJyaNwL/Zjks93fRiv/1ZrtVqbdLfaVnu/
+ZVuttg22dfTZPrI6tWazucnmW53259rpKbTa1r65D031OIDT0xps/WChR2QieHgHjdwAuadCHsNe
+AyQTnAb8B/MgEvyOhzSAXAg8mlBo7NUArYyjKAAeEjFx7cP9A5LG+JUdAw60UsG2JGHUgUsQaRjq
+/fdqzcyUT4XHQq1fGRpQ7qIWOAL8mUM0/ou5Cc4LuDRRAJsgacgTRA9pHETUI7GI7gRagCmba+gv
+GlssyV0QjWkgj5U3yTxmHpssfQLNVFXUWxP6AqO7FKJyfUXIy2/vDPda+faRZetQ/9Jpq1CrRx5q
+Z/SVXF1ckcvBJTkbDvu97sDYLgylkhE3iqacyW0zo3vbLmY4CsVuv2/CMLzR4XMy5TMMmZKs2CgV
+X5Oolxev9fegisJgXoH2z6huJBuizvkCybIZ838Bpk6Nm5BZ5DEFadv6D3RVbJjvoKu5GVV2Kiow
+1qBybp1R79sCWIFIjcyG+erg/SuueoPR9e0Ck2ATJpggrs/caZlaVYwrubrO1M6VlgmY+kxg8Sht
+4drPgHIpwiEBn3G0W4IKI72u3zcF0NHl0oRXVsyfpyqzxx5jLlhJ0LZ9uAjhJlT9SGECqFox3xdA
+XS/2D0y7jQVj/9BsW7piQANcTEyY0bmq0bsw1IVWAhUMEp+FWEfjBKgEkrkUutEsDljCyHlApTyC
+MNJWaJpEqgBr1sII0rBsLMSlQTCm7pRM0tDVXwl5oFOWxtgcIoFvFWmjbmYGQ08BmGskD4InCYJR
+VtC069Pwjnm7up1gy3Awo7F/sVmcoHwQRA/Ma7kKH5PYT5Ij9G+qp1lfq2wHmHB4SoHdMzGvNRUf
+Sg+MKCdizNBjtsb9OnrD0kSgKana28JnROgFTGiLMy5nNHH9oovxUD1UOkAXwboYYGy+ocvwC3zD
+4I8yz2SCXc6FCyr9ER0HDBrVNhtGpHDxBAY3/f5xrVmDXOc+4t6rplyNB8eWaaiP1UXV60kCDbwY
+IHjpYyI/YS4rr3/vXpObgdO7vuz2L7/3VHqOjIUgdtQtPgHjyjHe3A/qdW1lS+2mFKo7YmAQSklo
+7oyu4gvrJiQiZXqPF6yN+T5ZBavDx4+wmhK1bXP9tnmOFNLV7dbYQ3IRALyo28M6jlcwvIlfdSQ7
+VudQ9fCO9QnPZnYmyw0U9zodyG83g/PR5XBg5FvV1UXp6elJ33Cecl4+bKQC68nwnFx0nYtR96zf
+Mzb4md0YFciqI8uiJlimzrvi1y5IyvQFu+MSqyZRpSEvREblLqpt448q+8wztonTcxz0ESuhRMKi
+SWWpDi2w1Q7lpnV9j9uazVVjTQNGwnQ2ZgKPwqv344zljm1rljvtT6bdye5KauC5FInCQ2gcIzRp
+fCwukK0veIM0AZOtyOgYSwV/rOtcXKUcvFFuqKC3vtzTIMU6rR8kwLx9a8Fa0s3igGNFwlfldovw
+qoFlUUDDnyIJ353RNZ7bvrEsXdjdUhxjPvpBId3vDd5Im+DzUmOCpdrwOcpbx7gOv6KymjSbFQwa
+sD/9w+d/wskJ7DzvwPMzVBY+7NTLV9ghO6X5l3yij5ieLdAgwXi1wzobSiLx1J1A9+qqf0tG192B
+Q5zLrwWjq/6HMCpQecJV5nGv9BGp+BuofpFp2g0AAA==
+BLOB
+		;;
+	8.5) cat <<'BLOB'
+H4sIAAAAAAAC/6VXbW/iOBD+XH7FLB+2AUIbqI6+XVelLadWYqFq6Enb08kyiSE+ghPZSbvsbf/7
+jZ0EAi3d6poPxLFnHj/z4hnj88kEmjIdAN1n35N9xZTikdiPg5jk470AxtvXKs1m8y3dnbbT7jRb
+TrPdgpZz8lvrxDmoNBqNtzBf6rQPK+fn0Gw7HbsDDf06hPPzCuz8YMInKpFcTKGeA5BHKtUp7NdB
+MclpyH8wHyLJp1zQEHIh8GlCob5fAUQZR1EIXBA58VpHnUOSxrjKTgEfRClx25CwasAVyFQIs/9+
+pZFBBVT6TBj90mMI5SYagRPAnwVE43+Yl+C4oEsTTbABigqeIHtI4zCiPollNJWIADO2MNSfDbdY
+kWkYjWmoTrU1ySJmPptsLIHxVFnU3xL6gqO3EaLl/CshX669M9xb5dsnBy0T6uO2CbV+5aF2R1fk
+9vqW3AxuyMVw2O91B1a1AEoVI14UzThTVbtweLW1GkOh2u33zeRQ3JsYuhnCBcZtJQwlvOXsukNt
+WI1r76EXiXCxxvFd9O4VG6Li5TqXTTz74/T0IfISMo98ltGqOh/yXgnP/pX3Gm/Ty05Lic1Weu43
+d9T7ai/pbfDKnwxvff793usNRnffVuQkmzDJJPEC5s1KuVemu817d5nupVZdieNBYRJLzRIY1/43
+PY8iMRLyOUfQEj0RmRUz84vguoks+2oN0f6g9zIw9j3mkpU8Vm0drcL7C3r9SEztTXoZov2O4Jpi
+03HsVhurTadltx1TbqAOHqYuzOlCF/g9GJoqrYBKBknABBbhOAGqgGS2CS+axyFLGLkMqVInICKD
+QtMk0tWba5YiglQsuxLxaBiOqTcjk1R4ZpWQJzpjaYydJZL4VZK2anYGKHxNYGGYPEmeJEhGoyC0
+F1AxZf6e6UXYb1xMdWx+bB4nKB+G0RPzm57mxxQ2o+QE7ZuZYdYUS9sB5h+eY2CPTC4qDe0PrQdW
+lDtizNBitsX8GlrD0kQilNK9cWUzMvRDJg3inKs5TbygaIFc6JfOC+giWQ+DjJ1beAxX4CvmwCiz
+TCXYIj24pioY0XHIoF7u0SIihYlnMLjv908rjQrkOo8R99c6ejkeHPutpRfLk/qiQBKo460CyasA
+M/pfTGpt9Z/dO3I/cHt3N93+zUNPZ+nIWgliO97hE7BuXevF5aJWMyg7ejetUN4RA4NUlg7NjTEF
+f4VuQyJTZvZ4xgKa75OVthp8/gyvu0Rv29i+bZ4jhXR5uy146FwkAM/66rHNx694+C3/mqve8fGx
+vgAcOM6R3crO5HID7XuTDuSP+8Hl6GY4sPKtTHAyb3x60wFYTIaX5LrrXo+6F/2e9YZ12SVTUyvT
+3xS1wbFNthW/rcI1mb5kU66wYhJdEPLyY5WurwYbf3TtZ7710BtcEXd017eqxO25LtpYreUxt2GC
+pYtlG9XMpW9nvtCtNg0ZEel8zCSm/tr3qfHqQbtzaLzaPsKKd5BdrPSD51AmmgmhcYykrM/FZbP5
+BW+bNmBuFQkcY2Xg32sm9V7TDV8o13WMm18eaZgia/MiIabpSwRnQzcLAD6v5HdZbq+Iq36wCkqo
+BzP0wQO6EI9p39qULnB3lM7BBIKwkO73Bi+kbQj4UmOCldkKOMo7pzgPv6OyHjQaJQ6GcDD7K+B/
+w9kZ7P7chZ8/oTTxabe2/IRdsruEf84H5kSZ0YoNOhgvfVhWhSIKD9kZdG9v+9/I6K47cIl7c1V4
+9LX/LIxKVJ5wnXLcX9qIrvgP2uqmxgYOAAA=
 BLOB
 		;;
 	esac

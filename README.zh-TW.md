@@ -53,6 +53,25 @@ bash php-security-update.sh --only 74,82 # 只處理指定版本（版本號或�
 bash php-security-update.sh -y           # 不倒數，立即開始
 ```
 
+### 選用：session 物件注入硬化（`--harden`）
+
+這是跟兩個 CVE **無關的另一個**問題（官方這次的修補不會修它）：經典的
+`session.serialize_handler` 混用物件注入——攻擊者取得對受控物件的 `unserialize()`
+（常經由 `session.upload_progress`），再靠 POP chain 的 `__wakeup`/`__destruct` 執行程式碼。
+
+```bash
+bash php-security-update.sh --check --harden   # 預覽
+bash php-security-update.sh --harden -y        # 套用
+```
+
+`--harden` 會為每個 PHP 重編並打上一個選用的原始碼補丁：新增 `session.harden` ini
+（預設關），開啟它，並設定安全的 session 設定（`upload_progress.enabled=0`、
+`use_strict_mode=1`、`use_only_cookies=1`）。開啟後 session 解碼拒絕實例化物件（一律變成
+`__PHP_Incomplete_Class`），並淨化 upload_progress key。**即使某個 PHP 已是最新版，也會為
+它重編一次**以打上補丁。注意：它會停用 session 的物件反序列化，把物件存進 session 的應用會
+受影響，請先用 `--check` 預覽。PHP 5.4–5.6 只能封住 upload_progress 向量（7.0 以前無法做
+物件拒絕），詳見 [hardening/](hardening/)。
+
 ### 安全設計
 
 - 每個版本編譯並通過檢查後**才替換**；替換前**完整備份**，啟動驗證失敗會**自動還原**——網站只在 FPM 重啟時中斷約 1~2 秒。

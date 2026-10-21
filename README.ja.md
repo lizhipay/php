@@ -53,6 +53,28 @@ bash php-security-update.sh --only 74,82 # 指定バージョンのみ（バー�
 bash php-security-update.sh -y           # カウントダウンなしで即開始
 ```
 
+### 任意: セッションオブジェクト注入の緩和（`--harden`）
+
+2 件の CVE とは**別**の問題です（2026 年の公式パッチでは直りません）: 典型的な
+`session.serialize_handler` 不一致によるオブジェクト注入。攻撃者が（多くは
+`session.upload_progress` 経由で）任意オブジェクトの `unserialize()` を得て、POP チェーン
+の `__wakeup`/`__destruct` でコードを実行します。
+
+```bash
+bash php-security-update.sh --check --harden   # プレビュー
+bash php-security-update.sh --harden -y        # 適用
+```
+
+`--harden` は各 PHP を再コンパイルして任意のソースパッチを適用します: 新しい
+`session.harden` ini（既定オフ）を追加して有効化し、安全なセッション設定
+（`upload_progress.enabled=0`、`use_strict_mode=1`、`use_only_cookies=1`）を設定します。
+有効時はセッションのデコードがオブジェクトの生成を拒否し（すべて
+`__PHP_Incomplete_Class` になる）、upload_progress のキーをサニタイズします。**すでに最新版
+の PHP も一度だけ再コンパイル**してパッチを適用します。注意: セッションでのオブジェクトの
+デシリアライズを無効化するため、オブジェクトをセッションに保存するアプリは影響を受けます。
+まず `--check` で確認してください。PHP 5.4–5.6 では upload_progress 経路のみ塞げます
+（7.0 より前はオブジェクト拒否が不可能）。詳細は [hardening/](hardening/)。
+
 ### 安全設計
 
 - 各バージョンは置き換え**前**にコンパイルと検査を行い、**先にフルバックアップ**を取得。起動検証に失敗すると**自動でロールバック**——サイトは FPM 再起動時の約 1〜2 秒だけ途切れます。

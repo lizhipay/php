@@ -18,29 +18,36 @@ def gz(raw):  # deterministic: fixed mtime so the built script is reproducible
         f.write(raw)
     return buf.getvalue()
 
-branches = sorted(
-    (m.group(1) for p in patches.glob("php-*.patch")
-     for m in [re.fullmatch(r"php-(\d+\.\d+)\.patch", p.name)] if m),
-    key=lambda b: [int(x) for x in b.split(".")],
-)
+def embed(dir_, pat, fn_name, sha_name):
+    found = sorted(
+        (m.group(1) for p in dir_.glob(pat.replace("BRANCH", "*"))
+         for m in [re.fullmatch(pat.replace("BRANCH", r"(\d+\.\d+)"), p.name)] if m),
+        key=lambda b: [int(x) for x in b.split(".")],
+    )
+    sha, cases = [], []
+    for b in found:
+        raw = (dir_ / pat.replace("BRANCH", b)).read_bytes()
+        sha.append(f'{sha_name}[{b}]={hashlib.sha256(raw).hexdigest()}')
+        cases.append(f"\t{b}) cat <<'BLOB'\n{base64.encodebytes(gz(raw)).decode().strip()}\nBLOB\n\t\t;;")
+    body = "\tcase \"$1\" in\n" + "\n".join(cases) + "\n\tesac" if cases else "\t:"
+    dispatch = f"{fn_name}() {{\n{body}\n}}"
+    return found, "\n".join(sha), dispatch
+
+branches, bsha, bdispatch = embed(patches, "php-BRANCH.patch", "backport_blob", "BACKPORT_SHA256")
 if not branches:
     sys.exit("no patches/php-<branch>.patch files found")
+hbranches, hsha, hdispatch = embed(patches.parent / "hardening", "php-BRANCH-session-hardening.patch", "harden_blob", "HARDEN_SHA256")
 
-sha_lines, cases = [], []
-for b in branches:
-    raw = (patches / f"php-{b}.patch").read_bytes()
-    sha_lines.append(f'BACKPORT_SHA256[{b}]={hashlib.sha256(raw).hexdigest()}')
-    blob = base64.encodebytes(gz(raw)).decode("ascii").strip()
-    cases.append(f"\t{b}) cat <<'BLOB'\n{blob}\nBLOB\n\t\t;;")
-
-dispatch = "backport_blob() {\n\tcase \"$1\" in\n" + "\n".join(cases) + "\n\tesac\n}"
-
-text = text.replace("__BACKPORT_SHA256_ASSIGN__", "\n".join(sha_lines))
-text = text.replace("__BACKPORT_BLOBS__", dispatch)
-for leftover in ("__BACKPORT_SHA256_ASSIGN__", "__BACKPORT_BLOBS__", "__BACKPORT_BLOB_"):
+text = text.replace("__BACKPORT_SHA256_ASSIGN__", bsha)
+text = text.replace("__BACKPORT_BLOBS__", bdispatch)
+text = text.replace("__HARDEN_SHA256_ASSIGN__", hsha)
+text = text.replace("__HARDEN_BLOBS__", hdispatch)
+for leftover in ("__BACKPORT_SHA256_ASSIGN__", "__BACKPORT_BLOBS__", "__BACKPORT_BLOB_",
+                 "__HARDEN_SHA256_ASSIGN__", "__HARDEN_BLOBS__"):
     assert leftover not in text, f"unfilled placeholder: {leftover}"
 pathlib.Path(out).write_text(text, encoding="utf-8")
-print("embedded branches:", ", ".join(branches))
+print("backport branches:", ", ".join(branches))
+print("hardening branches:", ", ".join(hbranches) or "(none yet)")
 PY
 chmod 755 "$out"
 echo "built $out"

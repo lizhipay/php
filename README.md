@@ -53,6 +53,28 @@ bash php-security-update.sh --only 74,82 # only these versions (version number o
 bash php-security-update.sh -y           # no countdown, start now
 ```
 
+### Optional: session object-injection hardening (`--harden`)
+
+A **separate** issue from the two CVEs (the official 2026 patch does not fix it): the
+classic `session.serialize_handler` mismatch object injection, where an attacker gets an
+`unserialize()` of a controlled object (often via `session.upload_progress`) and runs a
+POP chain through `__wakeup`/`__destruct`.
+
+```bash
+bash php-security-update.sh --check --harden   # preview
+bash php-security-update.sh --harden -y        # apply
+```
+
+`--harden` rebuilds each PHP with an opt-in source patch that adds a new
+`session.harden` ini (default off), turns it on, and sets a safe session config
+(`upload_progress.enabled=0`, `use_strict_mode=1`, `use_only_cookies=1`). When on,
+session decoding refuses to instantiate objects (they become `__PHP_Incomplete_Class`)
+and `upload_progress` keys are sanitised. **Even a PHP already on the latest release is
+rebuilt once** to carry the patch. Caveat: it disables object deserialization in
+sessions, so apps that store objects in sessions are affected — preview with `--check`
+first. On PHP 5.4–5.6 only the upload_progress vector is closed (object-deny is not
+possible pre-7.0); see [hardening/](hardening/).
+
 ### Safety by design
 
 - Each version is compiled and checked **before** replacing; a **full backup** is taken first and a failed start **rolls back automatically** — the site only blips for ~1–2s during the FPM restart.

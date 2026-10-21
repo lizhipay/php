@@ -430,13 +430,14 @@ install_build_deps() {
 			install_packages gcc g++ make pkg-config patch libxml2-dev libsqlite3-dev \
 				libcurl4-openssl-dev libonig-dev libssl-dev zlib1g-dev libpng-dev libjpeg-dev \
 				libfreetype6-dev libwebp-dev libicu-dev libsodium-dev libzip-dev libxslt1-dev \
-				libbz2-dev libgmp-dev libreadline-dev libc-ares-dev
+				libbz2-dev libgmp-dev libreadline-dev libc-ares-dev libzstd-dev libbrotli-dev
 			;;
 		dnf|yum)
 			install_packages gcc gcc-c++ make pkgconfig patch libxml2-devel sqlite-devel \
 				libcurl-devel oniguruma-devel openssl-devel zlib-devel libpng-devel \
 				libjpeg-turbo-devel freetype-devel libwebp-devel libicu-devel libsodium-devel \
-				libzip-devel libxslt-devel bzip2-devel gmp-devel readline-devel c-ares-devel
+				libzip-devel libxslt-devel bzip2-devel gmp-devel readline-devel c-ares-devel \
+				libzstd-devel brotli-devel
 			;;
 		*) return 1 ;;
 	esac
@@ -1074,6 +1075,35 @@ list_modules() {
 	"$1" -c "$2" -m 2>/dev/null </dev/null | grep -E '^[A-Za-z][A-Za-z0-9_ ]*$' | sort -u
 }
 
+# When the link step fails with "cannot find -l<name>" (common on CentOS where the
+# runtime lib<name>.so.N exists but the dev symlink lib<name>.so is missing, e.g.
+# zstd pulled in via BaoTa's curl), install the -devel package and/or create the
+# missing dev symlink next to the runtime library. Returns 0 if anything was fixed.
+resolve_missing_libs() {
+	local log=$1 names name real base fixed=0
+	names=$(grep -oE 'cannot find -l[A-Za-z0-9_.+-]+' "$log" 2>/dev/null | sed 's/cannot find -l//' | sort -u)
+	[ -n "$names" ] || return 1
+	for name in $names; do
+		install_packages "lib${name}-dev" "${name}-devel" "lib${name}-devel" >/dev/null 2>&1
+		if printf 'int main(void){return 0;}' | "${CC:-cc}" -x c - "-l${name}" -o /dev/null >/dev/null 2>&1; then
+			fixed=1; continue
+		fi
+		real=$(ldconfig -p 2>/dev/null | awk -v n="lib${name}.so." 'index($1,n)==1 {print $NF; exit}')
+		[ -n "$real" ] && [ -e "$real" ] || real=$(find /lib /lib64 /usr/lib /usr/lib64 /usr/local -maxdepth 5 -name "lib${name}.so.*" 2>/dev/null | head -n1)
+		if [ -n "$real" ] && [ -e "$real" ]; then
+			base="lib${name}.so"
+			if ln -sf "$real" "$(dirname "$real")/$base" 2>/dev/null; then
+				ldconfig 2>/dev/null
+				warn "已建立缺少的連結符號連結：$(dirname "$real")/$base → $real"
+				fixed=1
+			fi
+		else
+			err "連結需要 lib${name}，但系統找不到，請先安裝 lib${name} 的開發套件後重試"
+		fi
+	done
+	[ "$fixed" = 1 ]
+}
+
 # Validates the staged build against the live php.ini / php-fpm.conf before touching anything.
 preflight_staged() {
 	local prefix=$1 staged=$2 ini="$1/etc/php.ini" before after missing out
@@ -1220,9 +1250,14 @@ process_build() {
 	fi
 	info "開始編譯（並行數 $JOBS，通常需要 5～20 分鐘）"
 	if ! run_make "$build"; then
-		show_log_tail "$CUR_LOG"
-		fail_version "$tag" "編譯失敗（線上版本沒有任何變動）"
-		return 1
+		if resolve_missing_libs "$CUR_LOG"; then
+			info "已補上缺少的連結函式庫，重試編譯…"
+			run_make "$build" || { show_log_tail "$CUR_LOG"; fail_version "$tag" "編譯失敗（線上版本沒有任何變動）"; return 1; }
+		else
+			show_log_tail "$CUR_LOG"
+			fail_version "$tag" "編譯失敗（線上版本沒有任何變動）"
+			return 1
+		fi
 	fi
 	if ! env "${BUILD_ENV[@]}" make -C "$build" install INSTALL_ROOT="$stage" </dev/null >>"$CUR_LOG" 2>&1; then
 		show_log_tail "$CUR_LOG"

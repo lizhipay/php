@@ -1,69 +1,76 @@
-# PHP 严重漏洞一键修复（CVE-2026-109618 / CVE-2026-109619）
+<div align="center">
 
-2026-10-21，PHP 官方发布安全公告：两个评分 CVSS 9.2 的严重漏洞，未经身份验证即可远程执行代码（RCE），影响所有对外提供服务的 PHP（PHP-FPM、Apache mod_php、php-cgi、FrankenPHP、LiteSpeed）。
+# PHP Security Update
 
-- 官方公告：<https://www.php.net/archive/2026.php#2026-10-21-5>
-- `CVE-2026-109618`（GHSA-w8hw-w9fx-j79w）：内存不足时用 `longjmp` 跳出，留下半初始化的请求状态被后续误用。
-- `CVE-2026-109619`（GHSA-6wmf-4rv5-p3rp）：上一个请求的内部状态残留，被下一个请求在正常初始化前读到（释放后使用）。
+**One command to fix the PHP critical RCE (CVE-2026-109618 / CVE-2026-109619).** Auto-detects every PHP on the server — BaoTa/aaPanel, source builds, distro packages — and fixes each the right way, with source-level backports for the EOL versions the PHP team never patched.
 
-**唯一彻底的解决办法是升级到已修复的 PHP 版本。** 本仓库帮你一键完成，并为官方已不再维护、但仍大量在跑的旧版本提供源代码级修补。
+[English](README.md) · [繁體中文](README.zh-TW.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
----
+![PHP 5.4–8.5](https://img.shields.io/badge/PHP-5.4%20%E2%80%93%208.5-777BB4?style=flat-square&logo=php&logoColor=white)
+[![Advisory](https://img.shields.io/badge/advisory-2026--10--21-red?style=flat-square)](https://www.php.net/archive/2026.php#2026-10-21-5)
 
-## 一键修复
+</div>
 
-在服务器上以 root 执行：
+## The vulnerability
 
-```bash
-bash php-security-update.sh
-```
+On 2026-10-21 the PHP project disclosed two critical (CVSS 9.2) vulnerabilities allowing **unauthenticated remote code execution**, affecting every PHP that serves web requests (PHP-FPM, Apache mod_php, php-cgi, FrankenPHP, LiteSpeed).
 
-脚本会**自动检测这台服务器上所有 PHP 安装**——不限宝塔——并按来源与版本分别处理：
+- Advisory: <https://www.php.net/archive/2026.php#2026-10-21-5>
+- `CVE-2026-109618` (GHSA-w8hw-w9fx-j79w): on out-of-memory, PHP `longjmp`s out of a half-initialized request; shutdown then acts on the invalid state.
+- `CVE-2026-109619` (GHSA-6wmf-4rv5-p3rp): request-owned global state survives into the next request and is read before normal init (use-after-free).
 
-| 来源 / 版本 | 处理方式 |
-|---|---|
-| 宝塔 / aaPanel（`/www/server/php/*`） | 自动重编并修复 |
-| 源码编译安装（`/usr/local`、`/opt`、LiteSpeed lsphp、PATH 上的 php-fpm） | 自动重编并修复 |
-| 系统套件安装（apt / yum 的 php-fpm） | **只提示**，请用套件管理工具更新（发行版已有修补，不自动重编） |
+**Updating to a fixed PHP build is the only complete fix.** This repo does that in one command, and provides source-level patches for the old versions that got no official backport.
 
-按版本：
+## One-command fix
 
-| 版本范围 | 处理方式 |
-|---|---|
-| 8.2 / 8.3 / 8.4 / 8.5 | 升级到同系列最新的已修复版本 |
-| 7.4 / 8.0 / 8.1 | 升级到该系列最后一版，套用 **PHP 官方** backport 后重编 |
-| 7.0 / 7.1 / 7.2 / 7.3 | 套用**本仓库移植**的源代码修补后重编 |
-| 5.4 / 5.5 / 5.6 | 套用**本仓库移植**的源代码修补后重编 |
-| 5.2 / 5.3 及无法修补者 | 套用官方缓解设置 |
-
-常用参数：
+Run as root on the server:
 
 ```bash
-bash php-security-update.sh --check      # 只检查，列出处理计划，不做任何改动
-bash php-security-update.sh --only 74,82 # 只处理指定版本（版本号或安装代号）
-bash php-security-update.sh -y           # 不倒计时，直接开始
+curl -fsSL https://raw.githubusercontent.com/lizhipay/php/main/php-security-update.sh -o php-security-update.sh && bash php-security-update.sh
 ```
 
-### 安全设计
+It **auto-detects every PHP install** — not just BaoTa — and handles each by source and version:
 
-- 每个版本编译并通过检查后才替换；**替换前完整备份**，启动验证失败会**自动还原**，网站只在 PHP 重启时中断约 1~2 秒。
-- 所有源代码一律**校验 SHA256**后才使用；补丁内嵌在脚本里并自校验。
-- 沿用原本的编译参数与编译器，升级后扩展模块与原来一致。
-- 托管在 systemd / init 的 PHP-FPM 用其服务重启；无服务管理器的源码安装用 `SIGUSR2` 平滑重载，无法自动重载时会提示手动重启（不乱动）。
-- 系统套件安装的 PHP 一律不碰，只给出套件更新指令——这符合官方建议。
+| Source | What it does |
+|---|---|
+| BaoTa / aaPanel (`/www/server/php/*`) | rebuild + patch automatically |
+| Source builds (`/usr/local`, `/opt`, LiteSpeed lsphp, `php-fpm` on PATH) | rebuild + patch automatically |
+| Distro packages (apt / yum php-fpm) | **advice only** — update via the package manager (the distro already ships the fix); never recompiled |
 
----
+| Version | What it does |
+|---|---|
+| 8.2 / 8.3 / 8.4 / 8.5 | upgrade to the latest fixed release of the branch |
+| 7.4 / 8.0 / 8.1 | last release + the **PHP team's official** backport, recompiled |
+| 7.0 / 7.1 / 7.2 / 7.3 | last release + **this repo's port** of that fix, recompiled |
+| 5.4 / 5.5 / 5.6 | last release + **this repo's port** of that fix, recompiled |
+| 5.2 / 5.3 and older | official mitigation settings only |
 
-## 源代码修补
+Common flags:
 
-官方只为 7.4 / 8.0 / 8.1 提供了 backport；更旧的版本没有任何官方修补。本仓库 `patches/` 下保存了可独立取用的补丁：
+```bash
+bash php-security-update.sh --check      # show the plan, change nothing
+bash php-security-update.sh --only 74,82 # only these versions (version number or install id)
+bash php-security-update.sh -y           # no countdown, start now
+```
 
-- `php-7.4.patch`、`php-8.0.patch`、`php-8.1.patch` —— **PHP 官方** backport（原样保存，附上游 commit）。
-- `php-7.0.patch` ~ `php-7.3.patch`、`php-5.4.patch` ~ `php-5.6.patch` —— 本仓库依照官方修补逻辑移植到旧版本。
+### Safety by design
 
-> 旧版本的移植补丁是**非官方**的，未经 PHP 官方审查，但每一版都在 Docker 中实际编译、并以 PHP 官方测试套件「修补前 vs 修补后」比对验证，确认没有破坏既有功能。每版的改动说明与验证数据见 `port-notes/`；各版本防护点的跨版一致性核对见 `port-notes/AUDIT-concat-guards.md`。
+- Each version is compiled and checked **before** replacing; a **full backup** is taken first and a failed start **rolls back automatically** — the site only blips for ~1–2s during the FPM restart.
+- Every source download is **SHA256-verified**; the patches are embedded in the script and self-checked.
+- The original configure flags and compiler are reused, so extensions match the old build.
+- PHP-FPM restart uses the service manager where present, otherwise a `SIGUSR2` graceful reload; if neither is possible it tells you to restart manually (it never guesses).
+- Distro-packaged PHP is never touched — only a package-update command is printed, matching the official advice.
 
-手动套用单个补丁：
+## Source patches
+
+The PHP team only shipped a backport for 7.4 / 8.0 / 8.1; older versions got nothing. `patches/` holds standalone patches you can use directly:
+
+- `php-7.4.patch`, `php-8.0.patch`, `php-8.1.patch` — **official** PHP backports, kept verbatim (upstream commit noted).
+- `php-7.0.patch` … `php-7.3.patch`, `php-5.4.patch` … `php-5.6.patch` — this repo's port of that fix to the older versions.
+
+> The old-version ports are **unofficial** and not vendor-reviewed, but each one was compiled in Docker and validated by running PHP's own test suite before vs after the patch to confirm no regressions. Per-version change notes and validation numbers are in `port-notes/`; the cross-version consistency check is in `port-notes/AUDIT-concat-guards.md`.
+
+Apply a single patch manually:
 
 ```bash
 cd php-7.3.33
@@ -71,24 +78,22 @@ patch -p1 < /path/to/php-7.3.patch
 ./configure ... && make && make install
 ```
 
----
-
-## 目录结构
+## Layout
 
 ```
-php-security-update.sh      一键修复脚本（自带所有补丁，可直接下发到服务器）
-patches/                    各版本独立补丁（8 个官方+移植，源代码级）
-src/                        脚本模板与构建器（build.sh 自动把 patches/ 嵌入脚本）
-port-notes/                 各旧版本移植的改动说明、验证数据与跨版核对
-docs/                       漏洞与修补的技术说明
+php-security-update.sh   one-command fixer (all patches embedded; ship as-is)
+patches/                 standalone per-version patches (3 official + 7 ported)
+src/                     script template + builder (build.sh embeds patches/)
+port-notes/              per-version change notes, validation data, cross-checks
+docs/                    technical notes on the vulnerability and the fix
 ```
 
-重新构建脚本（修改补丁或模板后）：
+Rebuild the script after editing a patch or the template:
 
 ```bash
 bash src/build.sh ./php-security-update.sh
 ```
 
-## 适用范围与免责声明
+## Scope & disclaimer
 
-适用于 Linux。源代码重编需要服务器能安装编译工具链并联网下载 PHP 源码（已校验 SHA256）。旧版本（7.0-7.3、5.4-5.6）的修补为非官方移植，按原样提供；生产环境请先用 `--check` 查看计划、并在低峰期执行（脚本带自动备份与还原）。彻底的长久之计仍是迁移到受官方支持的 PHP 版本。
+Linux only. Source recompiles need a working toolchain and internet to fetch the PHP sources (SHA256-verified). The old-version patches (7.0–7.3, 5.4–5.6) are unofficial ports, provided as-is; in production, run `--check` first and apply during off-peak hours (the script backs up and auto-reverts). The durable fix is still to migrate these sites to a supported PHP version.

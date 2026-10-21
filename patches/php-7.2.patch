@@ -1,0 +1,873 @@
+Backport: Avoid state corruption via bailout (PHP 7.2.34)
+
+Minimal mitigation for EOL PHP 7.2, backported from the official 7.4 fix
+(commit 712e60f9, "Avoid state corruption via bailout").
+
+Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618)
+Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619)
+
+Apply with: patch -p1 --forward --batch < php-7.2.patch
+Adaptations vs the 7.4 reference are recorded in port-notes/72.md
+(notably: the Zend/zend_types.h HT_HASH_RESET sub-hunk is dropped because
+7.2's HT_HASH_RESET is already an unconditional memset; the VM concat guards
+use ZEND_SIZE_MAX because 7.2 has no ZSTR_MAX_LEN; and the session rfc1867
+neutralisation uses "|| 1" because 7.2 has no C99 "true" in that unit).
+
+--- a/Zend/zend_API.h	2020-09-29 22:15:55
++++ b/Zend/zend_API.h	2026-10-21 08:47:14
+@@ -392,6 +392,7 @@
+ 
+ #define array_init(arg)			_array_init((arg), 0 ZEND_FILE_LINE_CC)
+ #define array_init_size(arg, size) _array_init((arg), (size) ZEND_FILE_LINE_CC)
++#define array_init_singleton(arg)	ZVAL_ARR((arg), zend_new_array_singleton())
+ #define object_init(arg)		_object_init((arg) ZEND_FILE_LINE_CC)
+ #define object_init_ex(arg, ce)	_object_init_ex((arg), (ce) ZEND_FILE_LINE_CC)
+ #define object_and_properties_init(arg, ce, properties)	_object_and_properties_init((arg), (ce), (properties) ZEND_FILE_LINE_CC)
+--- a/Zend/zend_alloc.c	2020-09-29 22:15:55
++++ b/Zend/zend_alloc.c	2026-10-21 09:19:42
+@@ -59,6 +59,7 @@
+ #include "zend_operators.h"
+ #include "zend_multiply.h"
+ #include "zend_bitset.h"
++#include "zend_execute.h"
+ 
+ #ifdef HAVE_SIGNAL_H
+ # include <signal.h>
+@@ -360,9 +361,44 @@
+ #if ZEND_DEBUG && defined(HAVE_KILL) && defined(HAVE_GETPID)
+ 	kill(getpid(), SIGSEGV);
+ #endif
+-	exit(1);
++	_exit(1);
+ }
+ 
++ZEND_API ZEND_COLD ZEND_NORETURN void zend_mm_safe_error_ex(const char *format, ...)
++{
++	zend_string *script_filename = NULL;
++	uint32_t script_lineno = 0;
++
++	if (zend_is_executing()) {
++		script_filename = zend_get_executed_filename_ex();
++		script_lineno = zend_get_executed_lineno();
++	} else if (zend_is_compiling()) {
++		script_filename = zend_get_compiled_filename();
++		script_lineno = zend_get_compiled_lineno();
++	}
++
++	va_list args;
++	va_start(args, format);
++
++	char buf[1024];
++	vsnprintf(buf, sizeof(buf), format, args);
++
++	va_end(args);
++
++	fprintf(stderr,
++			"\nFatal error: %s in %s on line %d\n",
++			buf,
++			script_filename ? ZSTR_VAL(script_filename) : "Unknown",
++			script_lineno);
++
++	/* See http://support.microsoft.com/kb/190351 */
++# ifdef ZEND_WIN32
++	fflush(stderr);
++# endif
++
++	_exit(1);
++}
++
+ static ZEND_COLD ZEND_NORETURN void zend_mm_safe_error(zend_mm_heap *heap,
+ 	const char *format,
+ 	size_t limit,
+@@ -372,22 +408,14 @@
+ #endif
+ 	size_t size)
+ {
++	(void) heap;
+ 
+-	heap->overflow = 1;
+-	zend_try {
+-		zend_error_noreturn(E_ERROR,
+-			format,
+-			limit,
++	zend_mm_safe_error_ex(format, limit,
+ #if ZEND_DEBUG
+-			filename,
+-			lineno,
++		filename,
++		lineno,
+ #endif
+-			size);
+-	} zend_catch {
+-	}  zend_end_try();
+-	heap->overflow = 0;
+-	zend_bailout();
+-	exit(1);
++		size);
+ }
+ 
+ #ifdef _WIN32
+@@ -1338,7 +1366,7 @@
+ 	size = MAX(size, 1);
+ 	size = ZEND_MM_ALIGNED_SIZE(size) + ZEND_MM_ALIGNED_SIZE(sizeof(zend_mm_debug_info));
+ 	if (UNEXPECTED(size < real_size)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu + %zu)", ZEND_MM_ALIGNED_SIZE(real_size), ZEND_MM_ALIGNED_SIZE(sizeof(zend_mm_debug_info)));
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu + %zu)", ZEND_MM_ALIGNED_SIZE(real_size), ZEND_MM_ALIGNED_SIZE(sizeof(zend_mm_debug_info)));
+ 		return NULL;
+ 	}
+ #endif
+@@ -1731,7 +1759,7 @@
+ 	void *ptr;
+ 
+ 	if (UNEXPECTED(new_size < size)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu + %zu)", size, alignment);
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu + %zu)", size, alignment);
+ 	}
+ 
+ #if ZEND_MM_LIMIT
+@@ -2527,7 +2555,7 @@
+ 
+ 	length = strlen(s);
+ 	if (UNEXPECTED(length + 1 == 0)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (1 * %zu + 1)", length);
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (1 * %zu + 1)", length);
+ 	}
+ 	p = (char *) _emalloc(length + 1 ZEND_FILE_LINE_RELAY_CC ZEND_FILE_LINE_ORIG_RELAY_CC);
+ 	memcpy(p, s, length+1);
+@@ -2539,7 +2567,7 @@
+ 	char *p;
+ 
+ 	if (UNEXPECTED(length + 1 == 0)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (1 * %zu + 1)", length);
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (1 * %zu + 1)", length);
+ 	}
+ 	p = (char *) _emalloc(length + 1 ZEND_FILE_LINE_RELAY_CC ZEND_FILE_LINE_ORIG_RELAY_CC);
+ 	memcpy(p, s, length);
+@@ -2553,7 +2581,7 @@
+ 	char *p;
+ 
+ 	if (UNEXPECTED(length + 1 == 0)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (1 * %zu + 1)", length);
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (1 * %zu + 1)", length);
+ 	}
+ 	p = (char *) malloc(length + 1);
+ 	if (UNEXPECTED(p == NULL)) {
+@@ -2827,7 +2855,7 @@
+ static ZEND_COLD ZEND_NORETURN void zend_out_of_memory(void)
+ {
+ 	fprintf(stderr, "Out of memory\n");
+-	exit(1);
++	_exit(1);
+ }
+ 
+ ZEND_API void * __zend_malloc(size_t len)
+--- a/Zend/zend_alloc.h	2020-09-29 22:15:55
++++ b/Zend/zend_alloc.h	2026-10-21 08:48:32
+@@ -399,6 +399,8 @@
+ 
+ */
+ 
++ZEND_API ZEND_COLD ZEND_NORETURN void zend_mm_safe_error_ex(const char *format, ...);
++
+ END_EXTERN_C()
+ 
+ #endif
+--- a/Zend/zend_execute_API.c	2020-09-29 22:15:55
++++ b/Zend/zend_execute_API.c	2026-10-21 08:48:49
+@@ -265,6 +265,10 @@
+ 
+ 	zend_objects_store_free_object_storage(&EG(objects_store), fast_shutdown);
+ 
++	/* may be used by zend_error_zstr_at before init_executor */
++	EG(error_handling) = EH_NORMAL;
++	EG(exception) = NULL;
++
+ 	/* All resources and objects are destroyed. */
+ 	/* No PHP callback functions may be called after this point. */
+ 	EG(active) = 0;
+@@ -299,6 +303,15 @@
+ 		} ZEND_HASH_FOREACH_END_DEL();
+ 
+ 		zend_cleanup_internal_classes();
++
++		/* may be used by zend_error_zstr_at before init_executor */
++		ZVAL_UNDEF(&EG(user_error_handler));
++		ZVAL_UNDEF(&EG(user_exception_handler));
++		memset(&EG(user_error_handlers_error_reporting), 0, sizeof(EG(user_error_handlers_error_reporting)));
++		memset(&EG(user_error_handlers), 0, sizeof(EG(user_error_handlers)));
++		memset(&EG(user_exception_handlers), 0, sizeof(EG(user_exception_handlers)));
++		EG(objects_store).object_buckets = NULL;
++		EG(objects_store).top = 1;
+ 	} else {
+ 		zend_hash_graceful_reverse_destroy(&EG(symbol_table));
+ 
+--- a/Zend/zend_hash.c	2020-09-29 22:15:55
++++ b/Zend/zend_hash.c	2026-10-21 08:49:07
+@@ -103,7 +103,7 @@
+ 	if (nSize < HT_MIN_SIZE) {
+ 		nSize = HT_MIN_SIZE;
+ 	} else if (UNEXPECTED(nSize >= HT_MAX_SIZE)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%u * %zu + %zu)", nSize, sizeof(Bucket), sizeof(Bucket));
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%u * %zu + %zu)", nSize, sizeof(Bucket), sizeof(Bucket));
+ 	}
+ 
+ #if defined(ZEND_WIN32)
+@@ -185,11 +185,19 @@
+ 	ht->nTableSize = zend_hash_check_size(nSize);
+ }
+ 
++ZEND_API HashTable* ZEND_FASTCALL zend_new_array_singleton(void)
++{
++	HashTable *ht = emalloc(sizeof(HashTable));
++	zend_hash_init(ht, 0, NULL, ZVAL_PTR_DTOR, 0);
++	ht->nTableSize = 1;
++	return ht;
++}
++
+ static void ZEND_FASTCALL zend_hash_packed_grow(HashTable *ht)
+ {
+ 	HT_ASSERT_RC1(ht);
+ 	if (ht->nTableSize >= HT_MAX_SIZE) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%u * %zu + %zu)", ht->nTableSize * 2, sizeof(Bucket), sizeof(Bucket));
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%u * %zu + %zu)", ht->nTableSize * 2, sizeof(Bucket), sizeof(Bucket));
+ 	}
+ 	ht->nTableSize += ht->nTableSize;
+ 	HT_SET_DATA_ADDR(ht, perealloc2(HT_GET_DATA_ADDR(ht), HT_SIZE(ht), HT_USED_SIZE(ht), ht->u.flags & HASH_FLAG_PERSISTENT));
+@@ -865,7 +873,7 @@
+ 		pefree(old_data, ht->u.flags & HASH_FLAG_PERSISTENT);
+ 		zend_hash_rehash(ht);
+ 	} else {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%u * %zu + %zu)", ht->nTableSize * 2, sizeof(Bucket) + sizeof(uint32_t), sizeof(Bucket));
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%u * %zu + %zu)", ht->nTableSize * 2, sizeof(Bucket) + sizeof(uint32_t), sizeof(Bucket));
+ 	}
+ }
+ 
+--- a/Zend/zend_hash.h	2020-09-29 22:15:55
++++ b/Zend/zend_hash.h	2026-10-21 08:49:13
+@@ -70,6 +70,7 @@
+ /* startup/shutdown */
+ ZEND_API void ZEND_FASTCALL _zend_hash_init(HashTable *ht, uint32_t nSize, dtor_func_t pDestructor, zend_bool persistent ZEND_FILE_LINE_DC);
+ ZEND_API void ZEND_FASTCALL _zend_hash_init_ex(HashTable *ht, uint32_t nSize, dtor_func_t pDestructor, zend_bool persistent, zend_bool bApplyProtection ZEND_FILE_LINE_DC);
++ZEND_API HashTable* ZEND_FASTCALL zend_new_array_singleton(void);
+ ZEND_API void ZEND_FASTCALL zend_hash_destroy(HashTable *ht);
+ ZEND_API void ZEND_FASTCALL zend_hash_clean(HashTable *ht);
+ #define zend_hash_init(ht, nSize, pHashFunction, pDestructor, persistent)						_zend_hash_init((ht), (nSize), (pDestructor), (persistent) ZEND_FILE_LINE_CC)
+--- a/Zend/zend_llist.c	2020-09-29 22:15:55
++++ b/Zend/zend_llist.c	2026-10-21 08:49:17
+@@ -114,6 +114,8 @@
+ 		current = next;
+ 	}
+ 
++	l->head  = NULL;
++	l->tail  = NULL;
+ 	l->count = 0;
+ }
+ 
+--- a/Zend/zend_multiply.h	2020-09-29 22:15:55
++++ b/Zend/zend_multiply.h	2026-10-21 08:49:57
+@@ -309,7 +309,7 @@
+ 	size_t ret = zend_safe_address(nmemb, size, offset, &overflow);
+ 
+ 	if (UNEXPECTED(overflow)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+ 		return 0;
+ 	}
+ 	return ret;
+@@ -322,7 +322,7 @@
+ 	size_t ret = zend_safe_address(nmemb, size, offset, &overflow);
+ 
+ 	if (UNEXPECTED(overflow)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in %s (%zu * %zu + %zu)", message, nmemb, size, offset);
++		zend_mm_safe_error_ex("Possible integer overflow in %s (%zu * %zu + %zu)", message, nmemb, size, offset);
+ 		return 0;
+ 	}
+ 	return ret;
+--- a/Zend/zend_strtod.c	2020-09-29 22:15:55
++++ b/Zend/zend_strtod.c	2026-10-21 08:50:09
+@@ -600,7 +600,7 @@
+ 		rv = (Bigint *)MALLOC(sizeof(Bigint) + (x-1)*sizeof(ULong));
+ 		if (!rv) {
+ 			FREE_DTOA_LOCK(0);
+-			zend_error_noreturn(E_ERROR, "Balloc() failed to allocate memory");
++			zend_mm_safe_error_ex("Balloc() failed to allocate memory");
+ 		}
+ #else
+ 		len = (sizeof(Bigint) + (x-1)*sizeof(ULong) + sizeof(double) - 1)
+@@ -613,7 +613,7 @@
+ 			rv = (Bigint*)MALLOC(len*sizeof(double));
+ 			if (!rv) {
+ 				FREE_DTOA_LOCK(0);
+-				zend_error_noreturn(E_ERROR, "Balloc() failed to allocate memory");
++				zend_mm_safe_error_ex("Balloc() failed to allocate memory");
+ 			}
+ #endif
+ 		rv->k = k;
+--- a/Zend/zend_vm_def.h	2020-09-29 22:15:55
++++ b/Zend/zend_vm_def.h	2026-10-21 08:52:39
+@@ -316,11 +316,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -2716,11 +2722,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+--- a/Zend/zend_vm_execute.h	2020-09-29 22:15:55
++++ b/Zend/zend_vm_execute.h	2026-10-21 08:52:39
+@@ -4406,11 +4406,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -5202,11 +5208,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -8524,11 +8536,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -9253,11 +9271,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -10580,11 +10604,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -11275,11 +11305,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -35136,11 +35172,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -37690,11 +37732,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -41657,11 +41705,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -44200,11 +44254,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -45369,11 +45429,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -47770,11 +47836,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -49343,11 +49415,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -49957,11 +50035,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -51749,11 +51833,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -52294,11 +52384,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -53079,11 +53175,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+@@ -53625,11 +53727,17 @@
+ 			    !ZSTR_IS_INTERNED(op1_str) && GC_REFCOUNT(op1_str) == 1) {
+ 			    size_t len = ZSTR_LEN(op1_str);
+ 
++				if (UNEXPECTED(len > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_extend(op1_str, len + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str) + len, ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+ 				ZVAL_NEW_STR(EX_VAR(opline->result.var), str);
+ 				break;
+ 			} else {
++				if (UNEXPECTED(ZSTR_LEN(op1_str) > ZEND_SIZE_MAX - ZSTR_LEN(op2_str))) {
++					zend_mm_safe_error_ex("Integer overflow in memory allocation");
++				}
+ 				str = zend_string_alloc(ZSTR_LEN(op1_str) + ZSTR_LEN(op2_str), 0);
+ 				memcpy(ZSTR_VAL(str), ZSTR_VAL(op1_str), ZSTR_LEN(op1_str));
+ 				memcpy(ZSTR_VAL(str) + ZSTR_LEN(op1_str), ZSTR_VAL(op2_str), ZSTR_LEN(op2_str)+1);
+--- a/ext/session/session.c	2020-09-29 22:15:52
++++ b/ext/session/session.c	2026-10-21 09:01:46
+@@ -3071,7 +3071,7 @@
+ 	if (php_session_rfc1867_orig_callback) {
+ 		retval = php_session_rfc1867_orig_callback(event, event_data, extra);
+ 	}
+-	if (!PS(rfc1867_enabled)) {
++	if (!PS(rfc1867_enabled) || 1) {
+ 		return retval;
+ 	}
+ 
+--- a/main/SAPI.c	2020-09-29 22:15:50
++++ b/main/SAPI.c	2026-10-21 08:50:23
+@@ -515,18 +515,23 @@
+ 	}
+ 	if (SG(request_info).auth_user) {
+ 		efree(SG(request_info).auth_user);
++		SG(request_info).auth_user = NULL;
+ 	}
+ 	if (SG(request_info).auth_password) {
+ 		efree(SG(request_info).auth_password);
++		SG(request_info).auth_password = NULL;
+ 	}
+ 	if (SG(request_info).auth_digest) {
+ 		efree(SG(request_info).auth_digest);
++		SG(request_info).auth_digest = NULL;
+ 	}
+ 	if (SG(request_info).content_type_dup) {
+ 		efree(SG(request_info).content_type_dup);
++		SG(request_info).content_type_dup = NULL;
+ 	}
+ 	if (SG(request_info).current_user) {
+ 		efree(SG(request_info).current_user);
++		SG(request_info).current_user = NULL;
+ 	}
+ 	if (sapi_module.deactivate) {
+ 		sapi_module.deactivate();
+--- a/main/main.c	2020-09-29 22:15:50
++++ b/main/main.c	2026-10-21 08:50:45
+@@ -621,6 +621,7 @@
+ 	PHP_INI_ENTRY("disable_functions",			"",			PHP_INI_SYSTEM,		NULL)
+ 	PHP_INI_ENTRY("disable_classes",			"",			PHP_INI_SYSTEM,		NULL)
+ 	PHP_INI_ENTRY("max_file_uploads",			"20",			PHP_INI_SYSTEM|PHP_INI_PERDIR,		NULL)
++	PHP_INI_ENTRY("max_multipart_body_parts",	"-1",			PHP_INI_SYSTEM|PHP_INI_PERDIR,		NULL)
+ 
+ 	STD_PHP_INI_BOOLEAN("allow_url_fopen",		"1",		PHP_INI_SYSTEM,		OnUpdateBool,		allow_url_fopen,		php_core_globals,		core_globals)
+ 	STD_PHP_INI_BOOLEAN("allow_url_include",	"0",		PHP_INI_SYSTEM,		OnUpdateBool,		allow_url_include,		php_core_globals,		core_globals)
+@@ -1894,6 +1895,8 @@
+ 
+ 		for (i=0; i<NUM_TRACK_VARS; i++) {
+ 			zval_ptr_dtor(&PG(http_globals)[i]);
++			/* May be accessed before php_request_startup() */
++			ZVAL_UNDEF(&PG(http_globals)[i]);
+ 		}
+ 	} zend_end_try();
+ 
+@@ -1947,6 +1950,9 @@
+ #ifdef HAVE_DTRACE
+ 	DTRACE_REQUEST_SHUTDOWN(SAFE_FILENAME(SG(request_info).path_translated), SAFE_FILENAME(SG(request_info).request_uri), (char *)SAFE_FILENAME(SG(request_info).request_method));
+ #endif /* HAVE_DTRACE */
++
++	/* May be accessed before php_request_startup() */
++	PG(modules_activated) = 0;
+ }
+ /* }}} */
+ 
+--- a/main/php_variables.c	2020-09-29 22:15:50
++++ b/main/php_variables.c	2026-10-21 08:51:06
+@@ -198,7 +198,7 @@
+ 			}
+ 
+ 			if (!index) {
+-				array_init(&gpc_element);
++				array_init_singleton(&gpc_element);
+ 				if ((gpc_element_p = zend_hash_next_index_insert(symtable1, &gpc_element)) == NULL) {
+ 					zval_ptr_dtor(&gpc_element);
+ 					zval_dtor(val);
+@@ -209,7 +209,7 @@
+ 				gpc_element_p = zend_symtable_str_find(symtable1, index, index_len);
+ 				if (!gpc_element_p) {
+ 					zval tmp;
+-					array_init(&tmp);
++					array_init_singleton(&tmp);
+ 					gpc_element_p = zend_symtable_str_update_ind(symtable1, index, index_len, &tmp);
+ 				} else {
+ 					if (Z_TYPE_P(gpc_element_p) == IS_INDIRECT) {
+@@ -217,7 +217,7 @@
+ 					}
+ 					if (Z_TYPE_P(gpc_element_p) != IS_ARRAY) {
+ 						zval_ptr_dtor(gpc_element_p);
+-						array_init(gpc_element_p);
++						array_init_singleton(gpc_element_p);
+ 					} else {
+ 						SEPARATE_ARRAY(gpc_element_p);
+ 					}
+@@ -406,7 +406,7 @@
+ 		case PARSE_POST:
+ 		case PARSE_GET:
+ 		case PARSE_COOKIE:
+-			array_init(&array);
++			array_init_singleton(&array);
+ 			switch (arg) {
+ 				case PARSE_POST:
+ 					zval_ptr_dtor(&PG(http_globals)[TRACK_VARS_POST]);
+--- a/main/rfc1867.c	2020-09-29 22:15:50
++++ b/main/rfc1867.c	2026-10-21 08:52:18
+@@ -407,6 +407,14 @@
+ 	return 0;
+ }
+ 
++static zend_bool php_mime_should_save_hdr(const char *name)
++{
++	return !strcasecmp(name, "Content-Disposition")
++		|| !strcasecmp(name, "Content-Type");
++}
++
++static char *php_mime_get_hdr_value(zend_llist header, char *key);
++
+ /* parse headers */
+ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header)
+ {
+@@ -447,10 +455,16 @@
+ 			}
+ 
+ 			*value = '\0';
+-			do { value++; } while (isspace(*value));
+ 
+-			key = estrdup(line);
+-			smart_string_appends(&buf_value, value);
++			/* Keep only headers we use, and ignore duplicates */
++			if (!php_mime_should_save_hdr(line)
++					|| php_mime_get_hdr_value(*header, line)) {
++				key = NULL;
++			} else {
++				key = estrdup(line);
++				do { value++; } while (isspace((unsigned char)*value));
++				smart_string_appends(&buf_value, value);
++			}
+ 		} else if (buf_value.c) { /* If no ':' on the line, add to previous line */
+ 			smart_string_appends(&buf_value, line);
+ 		} else {
+@@ -524,11 +538,11 @@
+ 	return res;
+ }
+ 
+-static char *substring_conf(char *start, int len, char quote)
++static char *substring_conf(char *start, size_t len, char quote)
+ {
+ 	char *result = emalloc(len + 1);
+ 	char *resp = result;
+-	int i;
++	size_t i;
+ 
+ 	for (i = 0; i < len && start[i] != quote; ++i) {
+ 		if (start[i] == '\\' && (start[i + 1] == '\\' || (quote && start[i + 1] == quote))) {
+@@ -556,14 +570,14 @@
+ 		char quote = *str;
+ 
+ 		str++;
+-		return substring_conf(str, (int)strlen(str), quote);
++		return substring_conf(str, strlen(str), quote);
+ 	} else {
+ 		char *strend = str;
+ 
+ 		while (*strend && !isspace(*strend)) {
+ 			++strend;
+ 		}
+-		return substring_conf(str, strend - str, 0);
++		return substring_conf(str, (size_t)(strend - str), 0);
+ 	}
+ }
+ 
+@@ -704,6 +718,7 @@
+ 	void *event_extra_data = NULL;
+ 	unsigned int llen = 0;
+ 	int upload_cnt = INI_INT("max_file_uploads");
++	int body_parts_cnt = INI_INT("max_multipart_body_parts");
+ 	const zend_encoding *internal_encoding = zend_multibyte_get_internal_encoding();
+ 	php_rfc1867_getword_t getword;
+ 	php_rfc1867_getword_conf_t getword_conf;
+@@ -725,6 +740,11 @@
+ 		return;
+ 	}
+ 
++	if (body_parts_cnt < 0) {
++		body_parts_cnt = PG(max_input_vars) + upload_cnt;
++	}
++	int body_parts_limit = body_parts_cnt;
++
+ 	/* Get the boundary */
+ 	boundary = strstr(content_type_dup, "boundary");
+ 	if (!boundary) {
+@@ -808,6 +828,11 @@
+ 		if ((cd = php_mime_get_hdr_value(header, "Content-Disposition"))) {
+ 			char *pair = NULL;
+ 			int end = 0;
++
++			if (--body_parts_cnt < 0) {
++				php_error_docref(NULL, E_WARNING, "Multipart body parts limit exceeded %d. To increase the limit change max_multipart_body_parts in php.ini.", body_parts_limit);
++				goto fileupload_done;
++			}
+ 
+ 			while (isspace(*cd)) {
+ 				++cd;

@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 #
-# BaoTa / aaPanel PHP security updater
+# PHP security updater — CVE-2026-109618 / CVE-2026-109619 (unauthenticated RCE)
 #
-# Rebuilds every PHP version installed under /www/server/php so that it is no
-# longer affected by CVE-2026-109618 / CVE-2026-109619 (unauthenticated RCE):
-#   8.2 and newer  -> latest release of the same branch from php.net
-#   7.4 / 8.0 / 8.1 -> last release + official backport patch (embedded below)
-#   5.x - 7.3      -> no fix exists; sets session.upload_progress.enabled = Off
+# Auto-detects every PHP install on the server (BaoTa/aaPanel, source builds under
+# /usr/local or /opt, LiteSpeed lsphp, and php-fpm on PATH) and fixes each:
+#   8.2 and newer    -> upgrade to the latest release of the same branch
+#   7.4 / 8.0 / 8.1  -> last release + the PHP team's official backport patch
+#   7.0-7.3, 5.4-5.6 -> last release + this project's port of that fix (unofficial)
+#   older / unmatched -> official mitigation settings only
+# Distro-packaged PHP is detected and left for the package manager (advice only).
 #
 # Advisory: https://www.php.net/archive/2026.php#2026-10-21-5
 #
-# Usage: bash bt-php-security-update.sh [--check] [--only 74,82] [--jobs N] [-y]
+# Usage: bash php-security-update.sh [--check] [--only 74,82] [--jobs N] [-y]
 # Env:   PHP_MIRROR  extra base URL serving php-X.Y.Z.tar.gz (always SHA256-verified)
 
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -24,7 +26,10 @@ readonly CVE_LABEL="CVE-2026-109618 / CVE-2026-109619"
 readonly PATCH_MARKER=".security-patch-cve-2026-109618"
 readonly MIN_FREE_MB=2048
 
+# Branches with a newer fixed release on php.net → upgrade to it.
 declare -A FIXED_RELEASE=([8.2]=8.2.35 [8.3]=8.3.36 [8.4]=8.4.27 [8.5]=8.5.12)
+
+# SHA256 of the php.net source tarball for each pinned release (verified on download).
 declare -A KNOWN_SHA256=(
 	[8.5.12]=81a0f450349e84b08eb43faa85f8a4c835684f3cc1c50471775d1317a046c525
 	[8.4.27]=5bafed9994c1a49796b25b5f61c22c9183bfe046b6acc7b363842d03c77f972f
@@ -33,19 +38,36 @@ declare -A KNOWN_SHA256=(
 	[8.1.34]=3c5b060ec8e0d5dd1d8237823f3161cc8bc5342aab3c46893eba9857759c4bfa
 	[8.0.30]=449d2048fcb20a314d8c218097c6d1047a9f1c5bb72aa54d5d3eba0a27a4c80c
 	[7.4.33]=5a2337996f07c8a097e03d46263b5c98d2c8e355227756351421003bea8f463e
+	[7.3.33]=9a369c32c6f52036b0a890f290327f148a1904ee66aa56e2c9a7546da6525ec8
+	[7.2.34]=8b2777c741e83f188d3ca6d8e98ece7264acafee86787298fae57e05d0dddc78
+	[7.1.33]=0055f368ffefe51d5a4483755bd17475e88e74302c08b727952831c5b2682ea2
+	[7.0.33]=d71a6ecb6b13dc53fed7532a7f8f949c4044806f067502f8fb6f9facbb40452a
+	[5.6.40]=56fb9878d12fdd921f6a0897e919f4e980d930160e154cbde2cc6d9206a27cac
+	[5.5.38]=4f458c9b504269615715a62f182b7c2f89bb8284f484befc221b56a1571b506e
+	[5.4.45]=25bc4723955f4e352935258002af14a14a9810b491a19400d76fcdfa9d04b28f
 )
-# https://github.com/php/php-src/tree/PHP-<branch>-CVE-2026-109618-109619
-declare -A BACKPORT_BASE=([7.4]=7.4.33 [8.0]=8.0.30 [8.1]=8.1.34)
+
+# EOL branches with no newer release: rebuild the last release + a source patch.
+# 7.4/8.0/8.1 use the PHP security team's official backport; 7.0-7.3 and 5.4-5.6 use
+# this project's port of that same fix (unofficial, see port-notes/ in the repo).
+declare -A BACKPORT_BASE=(
+	[8.1]=8.1.34 [8.0]=8.0.30 [7.4]=7.4.33
+	[7.3]=7.3.33 [7.2]=7.2.34 [7.1]=7.1.33 [7.0]=7.0.33
+	[5.6]=5.6.40 [5.5]=5.5.38 [5.4]=5.4.45
+)
+declare -A BACKPORT_OFFICIAL=([7.4]=1 [8.0]=1 [8.1]=1)
+# Provenance note shown to the user / written to the patch marker.
 declare -A BACKPORT_COMMIT=(
 	[7.4]=712e60f9edfd03f0960fc4fc3c2c375f42b90aa2
 	[8.0]=82f8f31b16a035c1b67cc253e79f7cc288f4cc20
 	[8.1]=1d7dec178a094e6e75b229ce22754045f8c6070a
+	[7.3]=lizhipay/php-backport [7.2]=lizhipay/php-backport
+	[7.1]=lizhipay/php-backport [7.0]=lizhipay/php-backport
+	[5.6]=lizhipay/php-backport [5.5]=lizhipay/php-backport [5.4]=lizhipay/php-backport
 )
-declare -A BACKPORT_SHA256=(
-	[7.4]=5fe57ca6ee96d59b36c6e0ca842843c50884f177bef1e85234cf669b577f5e48
-	[8.0]=534478c973cef6f493605b7af907f639a364912ee92c24598ddae44c3bc72d1c
-	[8.1]=c85ad0fddcbff7f2318617eeaa54d271135463b5bf70a01228447e3ed78de96e
-)
+# SHA256 of each embedded patch, generated from patches/ at build time.
+declare -A BACKPORT_SHA256
+__BACKPORT_SHA256_ASSIGN__
 
 CHECK_ONLY=0
 ASSUME_YES=0
@@ -76,6 +98,9 @@ PLAN_TAGS=()
 declare -A PLAN_CUR PLAN_ACTION PLAN_TARGET PLAN_SHA PLAN_NOTE
 declare -A RESULT_STATUS RESULT_AFTER RESULT_NOTE
 declare -A RELEASE_CACHE
+# Discovered PHP installs, keyed by a short id (tag). kind: baota|source|distro.
+declare -A INSTALL_PREFIX INSTALL_KIND INSTALL_SERVICE INSTALL_LABEL
+IS_BAOTA=0
 
 C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_BOLD="" C_DIM="" C_RESET=""
 
@@ -101,7 +126,7 @@ progress_done() { [ "$IS_TTY" = 1 ] && printf '\r\033[K' >&3; }
 banner() {
 	printf '%s' "$C_BOLD"
 	printf '══════════════════════════════════════════════════════════\n'
-	printf '  寶塔 PHP 安全更新  v%s\n' "$SCRIPT_VERSION"
+	printf '  PHP 安全更新  v%s\n' "$SCRIPT_VERSION"
 	printf '  修補 %s（PHP 遠端程式碼執行漏洞）\n' "$CVE_LABEL"
 	printf '══════════════════════════════════════════════════════════\n'
 	printf '%s' "$C_RESET"
@@ -110,21 +135,24 @@ banner() {
 
 usage() {
 	cat <<EOF
-寶塔 / aaPanel PHP 安全更新腳本 v${SCRIPT_VERSION}
+PHP 安全更新腳本 v${SCRIPT_VERSION}
 修補 ${CVE_LABEL}（PHP 遠端程式碼執行漏洞）
+自動偵測伺服器上所有 PHP（寶塔/aaPanel、原始碼編譯、LiteSpeed、PATH 上的 php-fpm）
 
-用法：bash bt-php-security-update.sh [選項]
+用法：bash php-security-update.sh [選項]
 
   --check        只檢查並列出處理計畫，不做任何變更
-  --only 74,82   只處理指定的 PHP 版本目錄（以逗號分隔）
+  --only 74,82   只處理指定的 PHP 版本（以逗號分隔，可用版本號如 74 或安裝代號）
   --jobs N       編譯並行數（預設依 CPU 與記憶體自動決定）
   -y, --yes      不倒數，立即開始
   -h, --help     顯示本說明
 
 處理方式：
-  PHP 8.2 以上     升級到同系列最新版
-  PHP 7.4/8.0/8.1  升級到該系列最後一版並套用 PHP 官方安全修補
-  PHP 5.x ~ 7.3    官方沒有修補，套用緩解設定並列出仍在使用的網站
+  PHP 8.2 以上       升級到同系列最新版
+  PHP 7.4/8.0/8.1    升級到該系列最後一版並套用 PHP 官方安全修補
+  PHP 7.0-7.3/5.4-5.6 套用本專案移植的安全修補後重新編譯
+  更舊 / 無法修補     套用官方緩解設定
+  系統套件安裝的 PHP  只提示，改用套件管理工具更新（不自動重編）
 
 環境變數：
   PHP_MIRROR       額外的原始碼下載來源（需提供 php-X.Y.Z.tar.gz，一律校驗 SHA256）
@@ -207,18 +235,21 @@ parse_args() {
 preflight() {
 	[ "$(id -u)" = 0 ] || die "請使用 root 身分執行"
 	[ "$(uname -s)" = Linux ] || die "只支援 Linux 伺服器"
-	if [ -s /var/bt_setupPath.conf ]; then
+	if [ -s /var/bt_setupPath.conf ] && grep -q '^/[A-Za-z0-9._/-]\+$' /var/bt_setupPath.conf; then
 		SETUP_PATH=$(head -n1 /var/bt_setupPath.conf | tr -d '[:space:]')
 	fi
 	SETUP_PATH=${SETUP_PATH:-/www}
-	[[ "$SETUP_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "寶塔安裝路徑異常：$SETUP_PATH"
 	SETUP_PATH=${SETUP_PATH%/}
-	PHP_ROOT="$SETUP_PATH/server/php"
-	WORK_DIR="$SETUP_PATH/server/php_security_update"
-	BACKUP_DIR="$SETUP_PATH/backup/php_security_update"
+	if [ -d "$SETUP_PATH/server/panel" ] && [ -d "$SETUP_PATH/server/php" ]; then
+		IS_BAOTA=1
+		PHP_ROOT="$SETUP_PATH/server/php"
+		WORK_DIR="$SETUP_PATH/server/php_security_update"
+		BACKUP_DIR="$SETUP_PATH/backup/php_security_update"
+	else
+		WORK_DIR="/var/tmp/php-security-update"
+		BACKUP_DIR="/var/backups/php-security-update"
+	fi
 	LOG_DIR="$BACKUP_DIR/logs"
-	[ -d "$SETUP_PATH/server/panel" ] || die "找不到寶塔面板（$SETUP_PATH/server/panel），此腳本只適用於寶塔 / aaPanel"
-	[ -d "$PHP_ROOT" ] || die "找不到 $PHP_ROOT，這台伺服器沒有透過寶塔安裝 PHP"
 	if command -v apt-get >/dev/null 2>&1; then
 		PKG_MANAGER=apt-get
 	elif command -v dnf >/dev/null 2>&1; then
@@ -226,6 +257,93 @@ preflight() {
 	elif command -v yum >/dev/null 2>&1; then
 		PKG_MANAGER=yum
 	fi
+}
+
+# True when the php binary at $1 is owned by the system package manager.
+is_distro_owned() {
+	local bin=$1 real
+	real=$(readlink -f "$bin" 2>/dev/null || printf '%s' "$bin")
+	case "$PKG_MANAGER" in
+		apt-get) dpkg -S "$real" >/dev/null 2>&1 ;;
+		dnf|yum) rpm -qf "$real" >/dev/null 2>&1 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Finds a service manager handle for a running/known php-fpm of this install.
+# Prints "init:<path>" | "systemd:<unit>" | "" (none).
+detect_fpm_service() {
+	local prefix=$1 tag=$2 unit frag
+	if [ "$IS_BAOTA" = 1 ]; then
+		[ -x "/etc/init.d/php-fpm-$tag" ] && { printf 'init:/etc/init.d/php-fpm-%s' "$tag"; return; }
+		if command -v systemctl >/dev/null 2>&1 && systemctl cat "php-fpm-$tag.service" >/dev/null 2>&1; then
+			printf 'systemd:php-fpm-%s.service' "$tag"; return
+		fi
+	fi
+	if command -v systemctl >/dev/null 2>&1; then
+		while read -r unit; do
+			[ -n "$unit" ] || continue
+			frag=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null)
+			[ -n "$frag" ] && [ -f "$frag" ] || continue
+			if grep -qF "$prefix/sbin/php-fpm" "$frag" 2>/dev/null || grep -qF "$prefix/" "$frag" 2>/dev/null; then
+				printf 'systemd:%s' "$unit"; return
+			fi
+		done < <(systemctl list-units --type=service --all --no-legend --plain 2>/dev/null | awk '/php.*fpm|fpm.*php/ {print $1}')
+	fi
+	printf ''
+}
+
+# Adds one discovered install to the maps. $1=prefix $2=kind-hint ("" = autodetect).
+register_install() {
+	local prefix=$1 kind=$2 bin tag real
+	prefix=${prefix%/}
+	bin="$prefix/bin/php"
+	[ -x "$bin" ] || return 1
+	real=$(readlink -f "$bin" 2>/dev/null)
+	for tag in "${!INSTALL_PREFIX[@]}"; do
+		[ "$(readlink -f "${INSTALL_PREFIX[$tag]}/bin/php" 2>/dev/null)" = "$real" ] && return 1
+	done
+	if [ -z "$kind" ]; then
+		if [ "$IS_BAOTA" = 1 ] && [ "${prefix#"$PHP_ROOT"/}" != "$prefix" ]; then
+			kind=baota
+		elif is_distro_owned "$bin"; then
+			kind=distro
+		else
+			kind=source
+		fi
+	fi
+	if [ "$kind" = baota ]; then
+		tag=${prefix##*/}
+	else
+		tag=$(printf '%s' "${prefix#/}" | tr -c 'A-Za-z0-9' '_')
+	fi
+	INSTALL_PREFIX[$tag]=$prefix
+	INSTALL_KIND[$tag]=$kind
+	INSTALL_LABEL[$tag]=$([ "$kind" = baota ] && printf 'PHP %s' "$tag" || printf '%s' "$prefix")
+	[ "$kind" = distro ] || INSTALL_SERVICE[$tag]=$(detect_fpm_service "$prefix" "$tag")
+	PLAN_TAGS+=("$tag")
+}
+
+# Discovers every PHP install: BaoTa dirs, common source prefixes, and PATH php-fpm.
+discover_installs() {
+	local d p
+	if [ "$IS_BAOTA" = 1 ]; then
+		for d in "$PHP_ROOT"/[0-9][0-9]; do
+			[ -d "$d" ] && register_install "$d" baota
+		done
+	fi
+	for d in /usr/local/php /usr/local/php[0-9]* /usr/local/php/* \
+		/opt/php /opt/php[0-9]* /opt/php/* /opt/remi/php*/root/usr \
+		/usr/local/lsws/lsphp[0-9]* /www/server/php/*; do
+		[ -d "$d" ] && [ -x "$d/bin/php" ] && register_install "$d"
+	done
+	for p in php php-fpm php-cgi; do
+		d=$(command -v "$p" 2>/dev/null) || continue
+		d=$(readlink -f "$d" 2>/dev/null)
+		# <prefix>/bin/php or <prefix>/sbin/php-fpm
+		d=${d%/bin/*}; d=${d%/sbin/*}
+		[ -x "$d/bin/php" ] && register_install "$d"
+	done
 }
 
 setup_logging() {
@@ -378,15 +496,26 @@ upload_progress_state() {
 		END { print v }' "$ini"
 }
 
+# Loaded php.ini path for an install (from `php --ini`), else the conventional path.
+php_ini_path() {
+	local prefix=$1 ini
+	ini=$("$prefix/bin/php" -n -r 'echo php_ini_loaded_file() ?: "";' 2>/dev/null </dev/null)
+	[ -z "$ini" ] && ini=$("$prefix/bin/php" -i 2>/dev/null </dev/null | sed -n 's/^Loaded Configuration File => //p' | head -n1)
+	[ -n "$ini" ] && [ "$ini" != "(none)" ] || ini="$prefix/etc/php.ini"
+	printf '%s' "$ini"
+}
+
 build_plan() {
-	local dir tag cur branch target state
-	for dir in "$PHP_ROOT"/[0-9][0-9]; do
-		[ -d "$dir" ] && [ -x "$dir/bin/php" ] || continue
-		tag=${dir##*/}
-		if [ -n "$ONLY_TAGS" ] && [[ ",$ONLY_TAGS," != *",$tag,"* ]]; then
+	local dir tag cur branch target state fix_label vtag
+	local -a tags=("${PLAN_TAGS[@]}")
+	PLAN_TAGS=()
+	for tag in "${tags[@]}"; do
+		dir=${INSTALL_PREFIX[$tag]}
+		cur=$(php_version_of "$dir")
+		vtag=${cur%%.*}${cur#*.}; vtag=${vtag%%.*}
+		if [ -n "$ONLY_TAGS" ] && [[ ",$ONLY_TAGS," != *",$tag,"* ]] && [[ ",$ONLY_TAGS," != *",$vtag,"* ]]; then
 			continue
 		fi
-		cur=$(php_version_of "$dir")
 		PLAN_TAGS+=("$tag")
 		PLAN_CUR[$tag]=${cur:-未知}
 		if [ -z "$cur" ]; then
@@ -395,22 +524,33 @@ build_plan() {
 		fi
 		branch=${cur%.*}
 
-		if [ -n "${BACKPORT_BASE[$branch]:-}" ]; then
+		if [ "${INSTALL_KIND[$tag]}" = distro ]; then
+			if [ -n "${FIXED_RELEASE[$branch]:-}" ] || [ -n "${BACKPORT_BASE[$branch]:-}" ]; then
+				PLAN_ACTION[$tag]=distro PLAN_NOTE[$tag]="系統套件安裝，請用套件管理工具更新（不自動重編）"
+			else
+				PLAN_ACTION[$tag]=distro PLAN_NOTE[$tag]="系統套件安裝且版本過舊，請用套件管理工具更新或改用新版"
+			fi
+		elif [ -n "${BACKPORT_BASE[$branch]:-}" ]; then
 			target=${BACKPORT_BASE[$branch]}
+			if [ -n "${BACKPORT_OFFICIAL[$branch]:-}" ]; then
+				fix_label="官方安全修補"
+			else
+				fix_label="安全修補（本專案移植，非官方）"
+			fi
 			if [ "$cur" = "$target" ] && [ -f "$dir/$PATCH_MARKER" ]; then
-				PLAN_ACTION[$tag]=ok PLAN_NOTE[$tag]="已套用官方安全修補"
+				PLAN_ACTION[$tag]=ok PLAN_NOTE[$tag]="已套用${fix_label}"
 			elif [ "$(ver_num "$cur")" -gt "$(ver_num "$target")" ]; then
 				PLAN_ACTION[$tag]=skip PLAN_NOTE[$tag]="非官方版本號，無法判斷，請手動確認"
 			else
 				PLAN_ACTION[$tag]=backport PLAN_TARGET[$tag]=$target PLAN_SHA[$tag]=${KNOWN_SHA256[$target]}
 				if [ "$cur" = "$target" ]; then
-					PLAN_NOTE[$tag]="重新編譯並套用官方安全修補"
+					PLAN_NOTE[$tag]="重新編譯並套用${fix_label}"
 				else
-					PLAN_NOTE[$tag]="升級到 $target 並套用官方安全修補"
+					PLAN_NOTE[$tag]="升級到 $target 並套用${fix_label}"
 				fi
 			fi
 		elif [ "$(ver_num "$cur")" -lt "$(ver_num 7.4.0)" ]; then
-			state=$(upload_progress_state "$cur" "$dir/etc/php.ini")
+			state=$(upload_progress_state "$cur" "$(php_ini_path "$dir")")
 			case "$state" in
 				na)  PLAN_ACTION[$tag]=warn PLAN_NOTE[$tag]="官方沒有修補，也沒有可用的緩解設定，請盡快改用 8.2 以上" ;;
 				off) PLAN_ACTION[$tag]=mitigated PLAN_NOTE[$tag]="已套用緩解設定，但官方沒有修補，仍有風險" ;;
@@ -436,15 +576,16 @@ print_plan() {
 	for tag in "${PLAN_TAGS[@]}"; do
 		case "${PLAN_ACTION[$tag]}" in
 			ok) color=$C_GREEN ;;
-			upgrade|backport|mitigate) color=$C_YELLOW ;;
+			upgrade|backport|mitigate|distro) color=$C_YELLOW ;;
 			*) color=$C_RED ;;
 		esac
-		printf '  PHP %-3s  %-8s  %s%s%s\n' "$tag" "${PLAN_CUR[$tag]}" "$color" "${PLAN_NOTE[$tag]}" "$C_RESET"
+		printf '  %-20s %-8s  %s%s%s\n' "${INSTALL_LABEL[$tag]}" "${PLAN_CUR[$tag]}" "$color" "${PLAN_NOTE[$tag]}" "$C_RESET"
 	done
 }
 
 sites_using() {
 	local tag=$1 f list=()
+	[ "$IS_BAOTA" = 1 ] || return 0
 	for f in "$SETUP_PATH"/server/panel/vhost/nginx/*.conf; do
 		[ -f "$f" ] && grep -qE "enable-php-${tag}(-wpfastcgi)?\.conf" "$f" && list+=("$(basename "$f" .conf)")
 	done
@@ -492,18 +633,16 @@ fpm_listen() {
 	sed -n 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*//p' "${files[@]}" 2>/dev/null | head -n1 | tr -d '[:space:]"'
 }
 
-# fd 3 (terminal) and 9 (lock) are closed so the daemon does not inherit them.
+# Runs an action on the install's php-fpm via its detected service handle.
+# Returns 127 when the install has no managed service. fd 3/9 closed so the
+# daemon does not inherit the terminal or the lock.
 fpm_service() {
-	local unit="php-fpm-$1.service"
-	if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$unit" 2>/dev/null; then
-		systemctl "$2" "$unit" 3>&- 9>&-
-	elif [ -x "/etc/init.d/php-fpm-$1" ]; then
-		"/etc/init.d/php-fpm-$1" "$2" 3>&- 9>&-
-	elif command -v systemctl >/dev/null 2>&1 && systemctl cat "$unit" >/dev/null 2>&1; then
-		systemctl "$2" "$unit" 3>&- 9>&-
-	else
-		return 127
-	fi
+	local svc=${INSTALL_SERVICE[$1]:-}
+	case "$svc" in
+		init:*) "${svc#init:}" "$2" 3>&- 9>&- ;;
+		systemd:*) systemctl "$2" "${svc#systemd:}" 3>&- 9>&- ;;
+		*) return 127 ;;
+	esac
 }
 
 fpm_force_restart() {
@@ -680,13 +819,29 @@ verify_fpm() {
 	return 0
 }
 
+# Returns 0 = restarted+verified, 1 = failed, 3 = binary swapped but FPM needs a
+# manual restart (no service manager and graceful reload could not be confirmed).
 restart_and_verify() {
-	local tag=$1 prefix=$2 expect=$3
-	fpm_service "$tag" restart </dev/null >>"$CUR_LOG" 2>&1
-	verify_fpm "$tag" "$prefix" "$expect" && return 0
-	warn "改用強制重啟再試一次…"
-	fpm_force_restart "$tag" "$prefix"
-	verify_fpm "$tag" "$prefix" "$expect"
+	local tag=$1 prefix=$2 expect=$3 pid
+	if [ -n "${INSTALL_SERVICE[$tag]:-}" ]; then
+		fpm_service "$tag" restart </dev/null >>"$CUR_LOG" 2>&1
+		verify_fpm "$tag" "$prefix" "$expect" && return 0
+		warn "改用強制重啟再試一次…"
+		fpm_force_restart "$tag" "$prefix"
+		verify_fpm "$tag" "$prefix" "$expect" && return 0
+		return 1
+	fi
+	# No service manager: graceful reload re-execs the master with the new binary.
+	pid=$(fpm_master_pid "$prefix")
+	if [ -n "$pid" ]; then
+		info "以 SIGUSR2 平滑重載 PHP-FPM（無服務管理器）…"
+		kill -USR2 "$pid" 2>/dev/null
+		sleep 2
+		verify_fpm "$tag" "$prefix" "$expect" && return 0
+		warn "無法自動重載這個 PHP-FPM，新版程式已就位，請手動重啟它讓修補生效"
+		return 3
+	fi
+	return 3
 }
 
 # ----------------------------------------------------------------- build ----
@@ -728,8 +883,8 @@ download_source() {
 
 apply_backport() {
 	local branch=$1 dir=$2 pf="$WORK_DIR/php-$1-security.patch"
-	"backport_blob_${branch/./}" | base64 -d | gzip -dc >"$pf" 2>>"$CUR_LOG"
-	if [ "$(sha256_of "$pf")" != "${BACKPORT_SHA256[$branch]}" ]; then
+	backport_blob "$branch" | base64 -d | gzip -dc >"$pf" 2>>"$CUR_LOG"
+	if [ ! -s "$pf" ] || [ "$(sha256_of "$pf")" != "${BACKPORT_SHA256[$branch]:-}" ]; then
 		err "內建修補檔校驗失敗，腳本可能已損毀，請重新下載"
 		return 1
 	fi
@@ -737,7 +892,11 @@ apply_backport() {
 		err "修補檔套用失敗"
 		return 1
 	fi
-	ok "已套用 PHP 官方安全修補（commit ${BACKPORT_COMMIT[$branch]:0:12}）"
+	if [ -n "${BACKPORT_OFFICIAL[$branch]:-}" ]; then
+		ok "已套用 PHP 官方安全修補（commit ${BACKPORT_COMMIT[$branch]:0:12}）"
+	else
+		ok "已套用本專案移植的安全修補（PHP $branch，非官方）"
+	fi
 }
 
 read_configure_args() {
@@ -859,11 +1018,13 @@ preflight_staged() {
 }
 
 backup_install() {
-	local tag=$1 cur=$2 rc
+	local tag=$1 cur=$2 rc prefix pdir pbase
+	prefix=${INSTALL_PREFIX[$tag]}
+	pdir=$(dirname "$prefix"); pbase=$(basename "$prefix")
 	BACKUP_FILE="$BACKUP_DIR/php$tag-$cur-$RUN_ID.tar.gz"
 	info "備份目前的 PHP $tag → $BACKUP_FILE"
-	tar -czf "$BACKUP_FILE" -C "$PHP_ROOT" --exclude="$tag/src" --exclude="$tag/src.tar.gz" \
-		--exclude="$tag/var/log/*" --exclude="$tag/var/run/*" "$tag" 2>>"$CUR_LOG"
+	tar -czf "$BACKUP_FILE" -C "$pdir" --exclude="$pbase/src" --exclude="$pbase/src.tar.gz" \
+		--exclude="$pbase/var/log/*" --exclude="$pbase/var/run/*" "$pbase" 2>>"$CUR_LOG"
 	rc=$?
 	if [ "$rc" -gt 1 ] || ! gzip -t "$BACKUP_FILE" 2>/dev/null; then
 		rm -f "$BACKUP_FILE"
@@ -877,7 +1038,7 @@ restore_backup() {
 	local tag=$1 prefix=$2 was_running=$3
 	warn "正在從備份還原 PHP $tag…"
 	[ "$was_running" = 1 ] && fpm_service "$tag" stop </dev/null >>"$CUR_LOG" 2>&1
-	if ! tar -xzf "$BACKUP_FILE" -C "$PHP_ROOT" 2>>"$CUR_LOG"; then
+	if ! tar -xzf "$BACKUP_FILE" -C "$(dirname "$prefix")" 2>>"$CUR_LOG"; then
 		err "自動還原失敗！請手動執行：tar -xzf $BACKUP_FILE -C $PHP_ROOT"
 		return 1
 	fi
@@ -901,18 +1062,18 @@ swap_install() {
 		rc=1
 	elif [ "$was_running" = 1 ]; then
 		info "重新啟動 PHP-FPM $tag…"
-		restart_and_verify "$tag" "$prefix" "$target" || rc=1
+		restart_and_verify "$tag" "$prefix" "$target"; rc=$?
 	else
 		info "PHP-FPM $tag 原本沒有在執行，維持停止狀態"
 	fi
-	if [ "$rc" = 0 ]; then
+	if [ "$rc" != 1 ]; then
 		cli=$("$prefix/bin/php" -n -r 'echo PHP_VERSION;' 2>/dev/null </dev/null)
 		if [ "$cli" != "$target" ]; then
 			err "命令列 PHP 版本為 ${cli:-無法執行}，預期為 $target"
 			rc=1
 		fi
 	fi
-	[ "$rc" = 0 ] || restore_backup "$tag" "$prefix" "$was_running"
+	[ "$rc" = 1 ] && restore_backup "$tag" "$prefix" "$was_running"
 	trap - INT TERM HUP PIPE
 	return "$rc"
 }
@@ -932,7 +1093,7 @@ finalize_install() {
 
 process_build() {
 	local tag=$1 mode=$2
-	local prefix="$PHP_ROOT/$tag" cur=${PLAN_CUR[$1]} target=${PLAN_TARGET[$1]} sha=${PLAN_SHA[$1]}
+	local prefix="${INSTALL_PREFIX[$1]}" cur=${PLAN_CUR[$1]} target=${PLAN_TARGET[$1]} sha=${PLAN_SHA[$1]}
 	local build="$WORK_DIR/build-$tag" stage="$WORK_DIR/stage-$tag"
 	local tarball="$WORK_DIR/php-$target.tar.gz" label=$target staged built free
 	CUR_LOG="$LOG_DIR/php$tag-build-$RUN_ID.log"
@@ -985,23 +1146,32 @@ process_build() {
 	preflight_staged "$prefix" "$staged" || { fail_version "$tag" "新版本檢查未通過，已取消替換（線上版本沒有任何變動）"; return 1; }
 	backup_install "$tag" "$cur" || { fail_version "$tag" "備份失敗，已取消替換"; return 1; }
 
-	if ! swap_install "$tag" "$prefix" "$staged" "$target"; then
+	swap_install "$tag" "$prefix" "$staged" "$target"; local swap_rc=$?
+	if [ "$swap_rc" = 1 ]; then
 		fail_version "$tag" "新版本啟動驗證失敗，已自動還原為 $cur"
 		return 1
 	fi
 	finalize_install "$tag" "$prefix" "$target" "$mode" "$tarball"
 	rm -rf "$build" "$stage" "$tarball"
+	local manual=""
+	[ "$swap_rc" = 3 ] && manual="（請手動重啟 PHP-FPM 讓修補生效）"
 	if [ "$mode" = backport ]; then
-		ok "PHP $tag 已更新為 $target 並套用官方安全修補"
-		set_result "$tag" patched "$target" "已套用官方安全修補"
+		if [ -n "${BACKPORT_OFFICIAL[${target%.*}]:-}" ]; then
+			ok "PHP $tag 已更新為 $target 並套用官方安全修補$manual"
+			set_result "$tag" patched "$target" "已套用官方安全修補$manual"
+		else
+			ok "PHP $tag 已重新編譯並套用安全修補（本專案移植，非官方）$manual"
+			set_result "$tag" patched "$target" "已套用安全修補（本專案移植）$manual"
+		fi
 	else
-		ok "PHP $tag 已升級為 $target"
-		set_result "$tag" upgraded "$target" "已升級"
+		ok "PHP $tag 已升級為 $target$manual"
+		set_result "$tag" upgraded "$target" "已升級$manual"
 	fi
 }
 
 process_mitigation() {
-	local tag=$1 prefix="$PHP_ROOT/$1" ini="$PHP_ROOT/$1/etc/php.ini" cur=${PLAN_CUR[$1]} f
+	local tag=$1 prefix="${INSTALL_PREFIX[$1]}" cur=${PLAN_CUR[$1]} f
+	local ini; ini=$(php_ini_path "$prefix")
 	local key='^[[:space:]]*;?[[:space:]]*session\.upload_progress\.enabled[[:space:]]*='
 	CUR_LOG="$LOG_DIR/php$tag-mitigation-$RUN_ID.log"
 	title "PHP $tag（$cur）：套用緩解設定"
@@ -1048,25 +1218,36 @@ process_mitigation() {
 # --------------------------------------------------------------- summary ----
 
 print_summary() {
-	local tag status color label sites any_vuln=0 failed=0
+	local tag status color label sites any_vuln=0 any_distro=0 failed=0
 	title "處理結果"
 	for tag in "${PLAN_TAGS[@]}"; do
 		status=${RESULT_STATUS[$tag]:-}
 		case "$status" in
 			upgraded|patched|ok) color=$C_GREEN ;;
-			mitigated) color=$C_YELLOW ;;
+			mitigated|distro) color=$C_YELLOW ;;
 			*) color=$C_RED ;;
 		esac
 		case "$status" in
-			upgraded)   label="✔ ${RESULT_NOTE[$tag]}" ;;
-			patched)    label="✔ ${RESULT_NOTE[$tag]}" ;;
-			ok)         label="✔ ${RESULT_NOTE[$tag]}" ;;
-			mitigated)  label="! ${RESULT_NOTE[$tag]}" ;;
-			fail)       label="✘ ${RESULT_NOTE[$tag]}"; failed=1 ;;
-			*)          label="✘ ${RESULT_NOTE[$tag]}" ;;
+			upgraded|patched|ok) label="✔ ${RESULT_NOTE[$tag]}" ;;
+			mitigated|distro)    label="! ${RESULT_NOTE[$tag]}" ;;
+			fail)                label="✘ ${RESULT_NOTE[$tag]}"; failed=1 ;;
+			*)                   label="✘ ${RESULT_NOTE[$tag]}" ;;
 		esac
-		printf '  PHP %-3s  %-8s → %-8s  %s%s%s\n' "$tag" "${PLAN_CUR[$tag]}" \
+		printf '  %-20s %-8s → %-8s  %s%s%s\n' "${INSTALL_LABEL[$tag]}" "${PLAN_CUR[$tag]}" \
 			"${RESULT_AFTER[$tag]:-${PLAN_CUR[$tag]}}" "$color" "$label" "$C_RESET"
+	done
+
+	for tag in "${PLAN_TAGS[@]}"; do
+		[ "${RESULT_STATUS[$tag]:-}" = distro ] || continue
+		if [ "$any_distro" = 0 ]; then
+			printf '\n%s以下 PHP 由系統套件安裝，請用套件管理工具更新（發行版已提供修補）：%s\n' "$C_YELLOW" "$C_RESET"
+			any_distro=1
+			case "$PKG_MANAGER" in
+				apt-get) printf '  指令範例：apt-get update && apt-get install --only-upgrade "php*" && systemctl restart "php*-fpm"\n' ;;
+				dnf|yum) printf '  指令範例：%s -y update "php*" && systemctl restart "php*-fpm"\n' "$PKG_MANAGER" ;;
+			esac
+		fi
+		printf '  %s（PHP %s）\n' "${INSTALL_LABEL[$tag]}" "${PLAN_CUR[$tag]}"
 	done
 
 	for tag in "${PLAN_TAGS[@]}"; do
@@ -1075,11 +1256,11 @@ print_summary() {
 			*) continue ;;
 		esac
 		if [ "$any_vuln" = 0 ]; then
-			printf '\n%s以下 PHP 版本官方已不再提供修補，請盡快在寶塔「網站 → 設定 → PHP 版本」改用 8.2 以上：%s\n' "$C_YELLOW" "$C_RESET"
+			printf '\n%s以下 PHP 版本官方已不再提供修補，建議盡快改用 8.2 以上：%s\n' "$C_YELLOW" "$C_RESET"
 			any_vuln=1
 		fi
 		sites=$(sites_using "$tag")
-		printf '  PHP %-3s  使用中的網站：%s\n' "$tag" "${sites:-（沒有網站使用）}"
+		printf '  %-20s%s\n' "${INSTALL_LABEL[$tag]}" "${sites:+  使用中的網站：$sites}"
 	done
 
 	if [ "$MAIN_LOG" != /dev/null ]; then
@@ -1127,18 +1308,25 @@ main() {
 	fi
 	banner
 
+	discover_installs
+	if [ ${#PLAN_TAGS[@]} -eq 0 ]; then
+		warn "這台伺服器上沒有找到任何已安裝的 PHP"
+		finish 0
+	fi
 	build_plan
 	if [ ${#PLAN_TAGS[@]} -eq 0 ]; then
-		warn "$PHP_ROOT 底下沒有找到任何已安裝的 PHP"
+		warn "沒有符合 --only 條件的 PHP"
 		finish 0
 	fi
 	print_plan
 
+	local advise=0
 	for tag in "${PLAN_TAGS[@]}"; do
 		case "${PLAN_ACTION[$tag]}" in
 			upgrade) builds=$((builds + 1)) pending=1 ;;
 			backport) builds=$((builds + 1)) pending=1 need_patch=1 ;;
 			mitigate) pending=1 ;;
+			distro|warn) advise=1 ;;
 		esac
 	done
 
@@ -1146,6 +1334,10 @@ main() {
 		printf '\n'
 		if [ "$pending" = 1 ]; then
 			info "以上為檢查結果，未做任何變更。移除 --check 參數即可開始處理"
+			exit 2
+		fi
+		if [ "$advise" = 1 ]; then
+			warn "沒有需要本腳本重編的版本，但有 PHP 需你另外處理（見上方標示），例如系統套件更新"
 			exit 2
 		fi
 		ok "所有可修補的 PHP 版本都已是安全版本"
@@ -1182,6 +1374,7 @@ main() {
 			mitigate) process_mitigation "$tag" ;;
 			ok) set_result "$tag" ok "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			mitigated) set_result "$tag" mitigated "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
+			distro) set_result "$tag" distro "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			warn) set_result "$tag" warn "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 			*) set_result "$tag" skip "${PLAN_CUR[$tag]}" "${PLAN_NOTE[$tag]}" ;;
 		esac
@@ -1192,24 +1385,8 @@ main() {
 }
 
 # ------------------------------------------------- embedded backport patches ----
-# Source: https://github.com/php/php-src/commit/<BACKPORT_COMMIT>.patch (gzip + base64)
-
-backport_blob_74() {
-	cat <<'BLOB'
-__BACKPORT_BLOB_74__
-BLOB
-}
-
-backport_blob_80() {
-	cat <<'BLOB'
-__BACKPORT_BLOB_80__
-BLOB
-}
-
-backport_blob_81() {
-	cat <<'BLOB'
-__BACKPORT_BLOB_81__
-BLOB
-}
+# Each patch (patches/php-<branch>.patch) is gzip+base64-embedded below at build time.
+# backport_blob <branch> writes the encoded blob to stdout.
+__BACKPORT_BLOBS__
 
 main "$@"
